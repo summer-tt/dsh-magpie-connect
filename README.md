@@ -18,6 +18,32 @@
 - **路由浮窗** — 输入框右侧的 Magpie 图标，桌面悬停（手机端点按）即显示网关路由的压缩视图：当前会话最近一次请求走了哪条路由、命中/避开了哪些账号/模型及耗时；无会话时回退显示整份 trace 里最新的一条路由。数据由插件在 Host 侧用已保存的 Key 读取（`/api/magpie-trace`，聚合网关的 `/v1/magpie/quotas`、`/v1/magpie/concurrency`、`/v1/magpie/route` 与 Web 的 `/api/gateway/trace`），浏览器不接触 Key；账号持有人只以首字符形式出现在页面上。
 - **完整路由组详情（可选）** — 在设置页填入 Magpie Web Key 后，浮窗会从 Magpie Web 的完整 trace 读取当前会话的路由组、嵌套子路由组（如 `Hy4 auto/hy4free`、`GPT-6 Luna auto/gpt-6-luna`）、候选账号、逐次尝试、限流/失效原因与恢复时间，并通过 Host 同源代理显示供应商图标；Web Key 仅保存在 Host 的 `settings.json`（文件权限 `0600`），设置页不回显。未配置或 Web Key 失效时自动回退到简化视图。
 
+## T3 会话速度与上下文窗口
+
+配合支持会话滑杆的 T3 Model Picker，在 Magpie 中选 `codex/gpt-6.2-sol` 或 `codex/gpt-6.2-astra`。两个基础模型初始均提供 272K、500K、872K 三个本地窗口。首次使用的默认值是 Fast 与 500K，后续新会话沿用该 provider 和模型最近一次手动选择。现有会话恢复自己的设置。同一 provider 和模型的子 Agent（含 `subagent_fork`）在创建时复制一次父 Agent 的设置，之后可独立运行。选择其他基础模型时使用目标模型自己的偏好。
+
+在插件的 Cordis `config` 中可以独立关闭两项功能。例如以下配置仅关闭速度控制：
+
+```yaml
+sessionSpeedEnabled: false
+sessionContextWindowEnabled: true
+```
+
+两个开关默认都为 `true`。关闭速度控制后，普通请求沿用网关默认策略。开启时，Standard 省略 `service_tier`，Fast 请求 `priority`，Ultrafast 请求 `ultrafast`。关闭上下文控制后，DSH 恢复使用网关模型目录的窗口和相应的默认输出上限。滑杆上的 872K 是 DSH 的本地预算，上游实际接受的长度取决于路由。两项设置均不改变请求模型 ID。
+
+`sessionControlRoutes` 可替换内置路由清单。每项按完整 `provider` 和 `model` 匹配。自定义路由示例：
+
+```yaml
+sessionControlRoutes:
+  - provider: magpie
+    model: codex/gpt-6.2-sol
+    speed: { options: [standard, fast, ultrafast], default: fast }
+    contextWindow: { options: [272000, 500000, 872000], default: 500000 }
+    efforts: [low, medium, high]
+```
+
+如要同时启用 Astra，请在数组中为 `codex/gpt-6.2-astra` 增加一项。省略 `efforts` 时使用目录公布的推理档位。
+
 ## 安装
 
 ```sh

@@ -61,6 +61,41 @@ export interface CatalogLike {
     contextWindowFor?(model: string): number;
     maxTokensFor?(model: string): number;
 }
+interface SessionControls {
+    speed?: 'standard' | 'fast' | 'ultrafast';
+    contextWindow?: number;
+}
+export interface MagpieAdapterOptions {
+    magpieBaseUrl?: string;
+    baseUrl?: string;
+    providerOverride?: unknown;
+    /** Route id registered into DSH (model `provider` field + pi-ai provider tag). */
+    providerId?: string;
+    /** Display name reported via providerInfo (model picker grouping label). */
+    displayName?: string;
+    /** Gateway credential (the gateway needs none). */
+    apiKey?: string;
+    /** Live endpoint read per request, with the static endpoint as fallback. */
+    runtime?: RuntimeEndpoint;
+    /** Connection-setup retries for 429/5xx (default 2). */
+    maxRetries?: number;
+    /** Overall SDK request cap in ms (default 300000). */
+    timeoutMs?: number;
+    /** Stall watchdog: max wait for the first upstream event in ms (default 90000; <=0 disables). */
+    firstEventTimeoutMs?: number;
+    /** Stall watchdog: max silence between upstream events in ms (default 60000; <=0 disables). */
+    idleTimeoutMs?: number;
+    /** Harness attachment service for image bytes. */
+    resolveAttachments?: () => AttachmentStore | undefined;
+    /** The Host initiator supplies session identity during model resolution and call preparation. */
+    resolveInitiatorSessionId?: () => string | undefined;
+    /** Missing controls preserve the catalog limits or the gateway's speed default. */
+    resolveSessionControls?: (provider: string, model: string, sessionId?: string) => SessionControls;
+    /** Optional reasoning-effort filter for this exact route. */
+    resolveAllowedEfforts?: (provider: string, model: string) => readonly string[] | undefined;
+    /** An existing explicit selection may stay valid for its initiating Agent. */
+    resolveInitiatorReasoningEffort?: (provider: string, model: string) => string | undefined;
+}
 /** Connection-setup retries (429/5xx with backoff, interruptible by abort). */
 export declare const DEFAULT_MAX_RETRIES = 2;
 /** Overall SDK request cap (replaces the OpenAI SDK 10 min default). */
@@ -86,32 +121,7 @@ export declare const DEFAULT_IDLE_TIMEOUT_MS = 60000;
 export declare function planReasoningEffort(requested: unknown, model: string, catalog: Pick<CatalogLike, 'thinks' | 'supportsEffort' | 'reasoningFor'>): string | undefined;
 export declare class MagpieAdapter {
     #private;
-    constructor(catalog: CatalogLike, options?: {
-        magpieBaseUrl?: string;
-        baseUrl?: string;
-        providerOverride?: unknown;
-        /** Route id registered into DSH (model `provider` field + pi-ai provider tag). */
-        providerId?: string;
-        /** Display name reported via providerInfo (model picker grouping label). */
-        displayName?: string;
-        /** Gateway credential (the gateway needs none). */
-        apiKey?: string;
-        /**
-         * Live endpoint read per request (settings page). Falls back to the
-         * static `magpieBaseUrl`/`apiKey` options when absent.
-         */
-        runtime?: RuntimeEndpoint;
-        /** Connection-setup retries for 429/5xx (default 2). */
-        maxRetries?: number;
-        /** Overall SDK request cap in ms (default 300000). */
-        timeoutMs?: number;
-        /** Stall watchdog: max wait for the first upstream event in ms (default 90000; <=0 disables). */
-        firstEventTimeoutMs?: number;
-        /** Stall watchdog: max silence between upstream events in ms (default 60000; <=0 disables). */
-        idleTimeoutMs?: number;
-        /** Harness attachment service for image bytes (wired in index.ts). */
-        resolveAttachments?: () => AttachmentStore | undefined;
-    });
+    constructor(catalog: CatalogLike, options?: MagpieAdapterOptions);
     providerInfo(provider: string): {
         id: string;
         name: string;
@@ -157,16 +167,6 @@ export declare class MagpieAdapter {
         model: ReturnType<MagpieAdapter['resolveModel']>;
         stream: (options: HarnessGenerateOptions) => AsyncGenerator<HarnessChunk>;
     }>;
-    /**
-     * Stream one chat turn from the Magpie gateway: a single pi-ai stream,
-     * translated to harness chunks verbatim. Upstream failures (rate limit,
-     * auth, timeout, transport) arrive as classified finish reasons, and
-     * turn-level retries stay owned by DSH.
-     *
-     * A stall watchdog races every upstream event against a timer: on expiry
-     * the upstream is aborted and the turn ends fast with a TIMEOUT error
-     * instead of hanging to the SDK/harness timeout.
-     */
     stream(options: HarnessGenerateOptions): AsyncGenerator<HarnessChunk>;
     /** Expose the live catalog snapshot for diagnostics. */
     catalogStatus(): {
@@ -180,3 +180,4 @@ export declare class MagpieAdapter {
 }
 /** Build the adapter over a live catalog. */
 export declare function createMagpieAdapter(catalog: ModelCatalog): MagpieAdapter;
+export {};
