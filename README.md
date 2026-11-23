@@ -46,12 +46,14 @@ sessionControlRoutes:
 ## 安装
 
 ```sh
-dsh plugin --profile web add dsh-magpie-connect
+dsh plugin --profile web add git+https://github.com/summer-tt/dsh-magpie-connect.git
 ```
 
 安装后重启 `dsh web`。
 
-已有安装用同一条命令即可更新到最新版本。
+该 Git URL 默认使用 `session-controls` 分支，Host 和客户端构建产物随源码提交。要固定版本，可在 URL 末尾加 `#` 和完整 commit SHA。
+
+全新 profile 使用 pnpm 12 时，如果提示 `ERR_PNPM_IGNORED_BUILDS` 并列出 `@google/genai` 和 `protobufjs`，可在该 profile 的 `pnpm-workspace.yaml` 的 `allowBuilds` 中把这两项设为 `false` 后重新安装，明确跳过这两个间接依赖的构建脚本。已有配置按 profile 原有策略处理。
 
 **需要**：DSH 的 web profile、Node.js ≥ 20、能访问网关。
 
