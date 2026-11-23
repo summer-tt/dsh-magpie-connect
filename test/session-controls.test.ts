@@ -13,6 +13,7 @@ import {
   handleSessionControls,
   type SessionControlsAgent,
   type SessionControlsCreated,
+  type SessionModelSelection,
 } from '../src/session-controls.ts'
 
 const sol = { provider: 'magpie', model: 'codex/gpt-6.2-sol' }
@@ -23,7 +24,7 @@ type Route = typeof sol
 
 interface StubAgent extends SessionControlsAgent {
   status: SessionControlsAgent['status']
-  selected: Route
+  selected: SessionModelSelection
   active?: Route
   busy: boolean
   runMaintenance: NonNullable<SessionControlsAgent['runMaintenance']>
@@ -362,6 +363,212 @@ test('both fields disabled bypass unreadable preference state and leave native e
   assert.equal(readFileSync(path, 'utf8'), 'not valid JSON')
 })
 
+function batchFixture(path: string, config: DshMagpieConnectConfig = {}, validateSelection = async (_selection: SessionModelSelection) => {}) {
+  const f = fixture(path, config)
+  const defaults: SessionModelSelection[] = []
+  const controls = new SessionControls({
+    config: resolveConfig({ providerId: 'magpie', ...config }),
+    store: f.store,
+    agents: () => f.agents,
+    catalogEfforts: (model) => [sol.model, astra.model].includes(model) ? ['low', 'medium', 'high'] : [],
+    validateSelection,
+    saveDefaultSelection: async (selection) => { defaults.push(selection) },
+    warn: (error) => f.warnings.push(error),
+  })
+  const agent = stubAgent('target')
+  const selected: SessionModelSelection[] = []
+  agent.model.select = (selection) => {
+    selected.push(selection)
+    agent.selected = selection
+  }
+  const result = { ...f, controls, selected, defaults, agent }
+  add(result, agent)
+  return result
+}
+
+function batchRequest(changes: unknown, expectedRevision?: string, route: Route = sol, sessionId = 'target'): Request {
+  return new Request(`http://localhost${SESSION_CONTROLS_API}`, {
+    method: 'POST', headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ sessionId, ...route, changes, expectedRevision }),
+  })
+}
+
+async function batchView(f: ReturnType<typeof batchFixture>) {
+  const response = await send(f, getRequest('target'))
+  assert.equal(response.status, 200)
+  const { ok, value } = await response.json()
+  assert.equal(ok, true)
+  assert.equal(value.batch, true)
+  assert.equal(typeof value.revision, 'string')
+  return value
+}
+
+test('batch validates every field before a write, records raw effort and rejects stale revisions', async (t) => {
+  const path = statePath(t)
+  const validated: SessionModelSelection[] = []
+  const f = batchFixture(path, {}, async (selection) => {
+    validated.push(selection)
+    if (selection.reasoningEffort === 'low') throw new Error('Low effort is unavailable')
+  })
+  const original = await batchView(f)
+  assert.equal(original.reasoningEffort, null)
+  assert.equal((await batchView(f)).revision, original.revision)
+  const before = readFileSync(path, 'utf8')
+  for (const changes of [{}, { speed: 'standard', extra: null }, { speed: 'standard', contextWindow: 123 },
+    { speed: 'standard', reasoningEffort: 'ultra' }, { speed: 'standard', reasoningEffort: 'low' }]) {
+    const reply = await send(f, batchRequest(changes, original.revision))
+    assert.equal(reply.status, 400)
+    assert.equal(readFileSync(path, 'utf8'), before)
+  }
+  assert.deepEqual(validated, [{ ...sol, reasoningEffort: 'low' }])
+  assert.deepEqual(f.selected, [])
+  assert.deepEqual(f.defaults, [])
+
+  const changes = { speed: 'ultrafast', contextWindow: 872_000, reasoningEffort: 'high' }
+  const writes = await Promise.all([send(f, batchRequest(changes, original.revision)),
+    send(f, batchRequest({ speed: 'standard' }, original.revision))])
+  assert.deepEqual(writes.map((response) => response.status).sort(), [200, 409])
+  // Determine the winning request by its echoed value; request parsing can finish in either order.
+  const first = await writes[0].json()
+  if (!first.ok) {
+    const retry = await send(f, batchRequest(changes, (await batchView(f)).revision))
+    assert.equal(retry.status, 200)
+  }
+  const saved = await batchView(f)
+  assert.notEqual(saved.revision, original.revision)
+  assert.equal(saved.speed.value, 'ultrafast')
+  assert.equal(saved.contextWindow.value, 872_000)
+  assert.equal(saved.reasoningEffort, 'high')
+  assert.deepEqual(f.selected, [{ ...sol, reasoningEffort: 'high' }])
+  assert.deepEqual(f.defaults, f.selected)
+  assert.deepEqual(selection(fixture(path, {}, f.agents), 'target'), { speed: 'ultrafast', contextWindow: 872_000 })
+
+  const reset = await send(f, batchRequest({ reasoningEffort: null }, saved.revision))
+  assert.equal(reset.status, 200)
+  assert.equal((await reset.json()).value.reasoningEffort, null)
+  assert.deepEqual(f.selected.at(-1), sol)
+  assert.deepEqual(f.defaults.at(-1), sol)
+})
+
+test('batch passes a matching current effort to native selection for recording', async (t) => {
+  const f = batchFixture(statePath(t))
+  const fallback = { ...sol, reasoningEffort: 'medium' }
+  f.agent.selected = fallback
+  const original = await batchView(f)
+  const saved = await send(f, batchRequest({ reasoningEffort: 'medium' }, original.revision))
+  assert.equal(saved.status, 200)
+  assert.deepEqual(f.selected, [fallback])
+  assert.deepEqual(f.defaults, [fallback])
+})
+
+test('batch rechecks the native effort after asynchronous validation', async (t) => {
+  const validating = deferred()
+  const resume = deferred()
+  const f = batchFixture(statePath(t), {}, async () => {
+    validating.resolve()
+    await resume.promise
+  })
+  const pending = send(f, batchRequest({ speed: 'standard', reasoningEffort: 'high' }))
+  await validating.promise
+  f.agent.selected = { ...sol, reasoningEffort: 'medium' }
+  resume.resolve()
+  assert.equal((await pending).status, 409)
+  const current = await batchView(f)
+  assert.equal(current.reasoningEffort, 'medium')
+  assert.equal(current.speed.value, 'fast')
+  assert.deepEqual(f.selected, [])
+})
+
+test('native write failure restores session and recent preferences and reports failed compensation', async (t) => {
+  const path = statePath(t)
+  const f = batchFixture(path)
+  const original = await batchView(f)
+  const before = readFileSync(path, 'utf8')
+  const select = f.agent.model.select!
+  f.agent.model.select = (next) => {
+    select(next)
+    if (next.reasoningEffort === 'high') throw new Error('native append failed after changing the selection')
+  }
+  const changes = { speed: 'ultrafast', contextWindow: 872_000, reasoningEffort: 'high' }
+  assert.equal((await send(f, batchRequest(changes, original.revision))).status, 500)
+  assert.equal(readFileSync(path, 'utf8'), before)
+  assert.deepEqual(await batchView(f), original)
+  assert.deepEqual(f.selected, [{ ...sol, reasoningEffort: 'high' }, sol])
+  assert.deepEqual(f.defaults, [])
+
+  const backup = `${path}.written`
+  f.agent.model.select = () => {
+    renameSync(path, backup)
+    mkdirSync(path)
+    throw new Error('native append and preference restoration failed')
+  }
+  const failure = await send(f, batchRequest(changes, original.revision))
+  assert.equal(failure.status, 500)
+  assert.match((await failure.json()).error, /Could not restore.*confirm/)
+  assert.ok(f.warnings.at(-1) instanceof AggregateError)
+  assert.deepEqual(f.defaults, [])
+  const recovered = await batchView(f)
+  assert.equal(recovered.speed.value, 'ultrafast')
+  assert.equal(recovered.contextWindow.value, 872_000)
+  assert.equal(recovered.reasoningEffort, null)
+  assert.notEqual(recovered.revision, original.revision)
+})
+
+test('batch preserves independent flags, including effort on an unlisted Magpie route', async (t) => {
+  for (const sessionSpeedEnabled of [true, false]) {
+    for (const sessionContextWindowEnabled of [true, false]) {
+      const f = batchFixture(statePath(t), { sessionSpeedEnabled, sessionContextWindowEnabled })
+      const original = await batchView(f)
+      assert.equal('speed' in original, sessionSpeedEnabled)
+      assert.equal('contextWindow' in original, sessionContextWindowEnabled)
+      const changes = { reasoningEffort: 'high', ...(sessionSpeedEnabled && { speed: 'standard' }),
+        ...(sessionContextWindowEnabled && { contextWindow: 272_000 }) }
+      assert.equal((await send(f, batchRequest(changes, original.revision))).status, 200)
+      assert.equal((await batchView(f)).reasoningEffort, 'high')
+      if (!sessionSpeedEnabled) assert.equal((await send(f, batchRequest({ speed: 'fast', reasoningEffort: 'low' }))).status, 400)
+      if (!sessionContextWindowEnabled) assert.equal((await send(f, batchRequest({ contextWindow: 500_000, reasoningEffort: 'low' }))).status, 400)
+      assert.equal((await batchView(f)).reasoningEffort, 'high')
+    }
+  }
+  const path = statePath(t)
+  writeFileSync(path, 'not valid JSON')
+  const f = batchFixture(path, { sessionSpeedEnabled: false, sessionContextWindowEnabled: false, sessionControlRoutes: [] })
+  const initial = await batchView(f)
+  assert.equal((await batchView(f)).revision, initial.revision)
+  assert.equal((await send(f, batchRequest({ reasoningEffort: 'medium' }, initial.revision))).status, 200)
+  assert.equal((await batchView(f)).reasoningEffort, 'medium')
+  assert.equal(readFileSync(path, 'utf8'), 'not valid JSON')
+
+  for (const unsupported of [other, { ...sol, provider: 'other-provider' }]) {
+    f.agent.selected = unsupported
+    const get = await send(f, getRequest('target', unsupported))
+    assert.deepEqual(await get.json(), { ok: true, value: {} })
+    assert.equal((await send(f, batchRequest({ reasoningEffort: 'high' }, undefined, unsupported))).status, 400)
+  }
+})
+
+test('subagent sessions retain speed and window writes but reject effort before changing any preference', async (t) => {
+  const f = batchFixture(statePath(t))
+  const child = stubAgent('child', sol, f.agent.id)
+  child.model.select = (next) => { child.selected = next }
+  add(f, child)
+  const response = await send(f, getRequest(child.id))
+  const { value: initial } = await response.json()
+  assert.equal(initial.batch, true)
+  for (const reasoningEffort of ['high', null]) {
+    const blocked = await send(f, batchRequest({ speed: 'ultrafast', reasoningEffort }, initial.revision, sol, child.id))
+    assert.equal(blocked.status, 409)
+    assert.match((await blocked.json()).error, /owned by subagent routing/)
+    assert.deepEqual(child.selected, sol)
+    assert.deepEqual(selection(f, child.id), defaultChoice)
+  }
+  const saved = await send(f, batchRequest({ speed: 'ultrafast', contextWindow: 872_000 }, initial.revision, sol, child.id))
+  assert.equal(saved.status, 200)
+  assert.deepEqual(selection(f, child.id), { speed: 'ultrafast', contextWindow: 872_000 })
+  assert.equal((await send(f, postRequest(child.id, 'speed', 'standard'))).status, 200)
+  assert.deepEqual(f.defaults, [])
+})
+
 test('apply registers GET/POST on connection.fetch and shares lifecycle data with the adapter', async (t) => {
   const path = statePath(t)
   __resetSettingsRoutes()
@@ -371,10 +578,27 @@ test('apply registers GET/POST on connection.fetch and shares lifecycle data wit
   const agents = new Map<string, SessionControlsAgent>()
   let initiator: SessionControlsAgent | undefined
   let adapter: MagpieAdapter | undefined
+  const validationCalls: SessionModelSelection[] = []
+  const defaultSaves: SessionModelSelection[] = []
+  const providerReads: string[] = []
+  let models = [{ id: 'codex/gpt-6.2-astra' }]
   const ctx: PluginContext = {
-    llm: { registerAdapter: (_providers, registered) => { adapter = registered as MagpieAdapter } },
+    llm: {
+      registerAdapter: (_providers, registered) => { adapter = registered as MagpieAdapter },
+      listModels: async (provider) => {
+        providerReads.push(provider)
+        return models
+      },
+      resolveCallConfig: async (requested) => {
+        validationCalls.push(requested)
+        return { ...requested, reasoningEffort: requested.reasoningEffort ?? 'medium' }
+      },
+    },
     logger: { warn: () => {}, info: () => {}, error: () => {} },
-    get: (key) => key === 'agents' && { get: (id: string) => agents.get(id), currentInitiator: () => initiator },
+    get: (key) => {
+      if (key === 'agents') return { get: (id: string) => agents.get(id), currentInitiator: () => initiator }
+      if (key === 'agentDefaultModel') return { saveSelection: async (value: SessionModelSelection) => { defaultSaves.push(value) } }
+    },
     on: (event, handler) => {
       handlers.set(event, handler)
       return () => { handlers.delete(event) }
@@ -403,4 +627,34 @@ test('apply registers GET/POST on connection.fetch and shares lifecycle data wit
   assert.equal(adapter.resolveModel(sol.provider, sol.model).context.contextWindow, 872_000)
   initiator = undefined
   assert.notEqual(adapter.resolveModel(sol.provider, sol.model).context.contextWindow, 872_000)
+
+  const target = stubAgent('target')
+  target.selected = { ...sol, reasoningEffort: 'high' }
+  target.model.select = (next) => { target.selected = next }
+  agents.set(target.id, target)
+  const initial = await (await route.fetch(getRequest(target.id))).json()
+  assert.equal(initial.value.batch, true)
+  const reset = { contextWindow: 872_000, reasoningEffort: null }
+  const unlisted = await route.fetch(batchRequest(reset, initial.value.revision))
+  assert.equal(unlisted.status, 400)
+  assert.match((await unlisted.json()).error, /Select an available model/)
+  assert.deepEqual(await (await route.fetch(getRequest(target.id))).json(), initial)
+  assert.deepEqual(defaultSaves, [])
+  const windowOnly = await route.fetch(batchRequest({ contextWindow: 272_000 }, initial.value.revision))
+  assert.equal(windowOnly.status, 200)
+  assert.equal((await windowOnly.json()).value.reasoningEffort, 'high')
+  assert.deepEqual(providerReads, [sol.provider])
+  assert.equal((await route.fetch(postRequest(target.id, 'speed', 'ultrafast'))).status, 200)
+
+  models = [{ id: sol.model }]
+  const current = await (await route.fetch(getRequest(target.id))).json()
+  const saved = await route.fetch(batchRequest(reset, current.value.revision))
+  assert.equal(saved.status, 200)
+  assert.equal((await saved.json()).value.reasoningEffort, null)
+  assert.deepEqual(target.selected, sol)
+  assert.deepEqual(validationCalls, [sol, sol])
+  assert.deepEqual(providerReads, [sol.provider, sol.provider])
+  assert.deepEqual(defaultSaves, [sol])
+  initiator = target
+  assert.equal(adapter.resolveModel(sol.provider, sol.model).context.contextWindow, 872_000)
 })

@@ -1,6 +1,6 @@
 import { ModelCatalog } from './adapter/catalog.ts';
 import { type DshMagpieConnectConfig } from './config.ts';
-import { SessionControls } from './session-controls.ts';
+import { SessionControls, type SessionModelSelection } from './session-controls.ts';
 import { SettingsStore, type EffectiveSearchSettings } from './settings.ts';
 /**
  * dsh-magpie-connect DSH cordis plugin entry.
@@ -25,6 +25,10 @@ export interface PluginContext {
     };
     llm?: {
         registerAdapter(providers: string[], adapter: unknown): unknown;
+        listModels?(provider: string): Promise<readonly {
+            id: string;
+        }[]>;
+        resolveCallConfig?(selection: SessionModelSelection, signal?: AbortSignal): Promise<unknown>;
     };
     get?(key: string): unknown;
     inject?(deps: string[], fn: (ctx: Record<string, unknown>) => unknown): unknown;

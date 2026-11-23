@@ -30,6 +30,8 @@ sessionContextWindowEnabled: true
 
 两个开关默认都为 `true`。关闭速度控制后，普通请求沿用网关默认策略。开启时，Standard 省略 `service_tier`，Fast 请求 `priority`，Ultrafast 请求 `ultrafast`。关闭上下文控制后，DSH 恢复使用网关模型目录的窗口和相应的默认输出上限。滑杆上的 872K 是 DSH 的本地预算，上游实际接受的长度取决于路由。两项设置均不改变请求模型 ID。
 
+配合新版 T3 Model Picker，收起菜单时一并提交修改过的推理等级、速度和窗口。Host 在写入前检查路由、档位和配置版本。关闭任一项后，T3 同时隐藏对应的滑杆和输入框状态。
+
 `sessionControlRoutes` 可替换内置路由清单。每项按完整 `provider` 和 `model` 匹配。自定义路由示例：
 
 ```yaml

@@ -7,23 +7,32 @@ export type SessionControlsSelection = {
     speed?: SessionControlSpeed;
     contextWindow?: number;
 };
-type Field = keyof SessionControlsSelection;
 type SessionRoute = Route & {
     sessionId: string;
 };
 type Change = SessionRoute & {
-    field: Field;
-    value: unknown;
+    changes: Record<string, unknown>;
+    batch: boolean;
+    expectedRevision?: string;
 };
 type Choice<T> = {
     options: readonly T[];
     value: T;
 };
-export interface SessionControlsView {
+type SessionControlsChoices = {
     speed?: Choice<SessionControlSpeed>;
     contextWindow?: Choice<number>;
     efforts?: string[];
-}
+};
+export type SessionControlsView = SessionControlsChoices & ({
+    batch: true;
+    revision: string;
+    reasoningEffort: string | null;
+} | {
+    batch?: never;
+    revision?: never;
+    reasoningEffort?: never;
+});
 /** Structural subset of the DSH agent APIs used by the Host plugin. */
 export interface SessionControlsAgent {
     readonly id: string;
@@ -40,6 +49,7 @@ export interface SessionControlsAgent {
     };
     readonly model: {
         current(): Readonly<SessionModelSelection> | undefined;
+        select?(selection: SessionModelSelection): void;
     };
     runMaintenance?<T>(task: (signal: AbortSignal) => Promise<T>): Promise<T>;
 }
@@ -58,22 +68,21 @@ export declare class SessionControlsStore {
     readonly path: string;
     constructor(path: string);
     snapshot(id: string, route: SessionControlRoute, inherited?: SessionControlsSelection): SessionControlsSelection;
-    set(id: string, route: SessionControlRoute, change: RequiredChange): SessionControlsSelection;
+    peek(id: string, route: SessionControlRoute): SessionControlsSelection;
+    /** Replace both preferences once and retain their previous state for synchronous compensation. */
+    set(id: string, route: SessionControlRoute, change: SessionControlsSelection): () => void;
 }
 export declare function acquireSessionControlsStore(dataDir: string): {
     store: SessionControlsStore;
     release: () => void;
-};
-type RequiredChange = {
-    speed: SessionControlSpeed;
-} | {
-    contextWindow: number;
 };
 interface SessionControlsOptions {
     config: ResolvedConfig;
     store: SessionControlsStore;
     agents: () => SessionControlsAgents | undefined;
     catalogEfforts: (model: string) => readonly string[];
+    validateSelection?: (selection: SessionModelSelection, signal: AbortSignal) => Promise<unknown>;
+    saveDefaultSelection?: (selection: SessionModelSelection) => Promise<void> | undefined;
     warn: (error: unknown) => void;
 }
 export declare class SessionControls {

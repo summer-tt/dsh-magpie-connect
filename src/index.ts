@@ -61,7 +61,11 @@ import {
 // of the exact @deepseek-ai/cordis version DSH ships.
 export interface PluginContext {
   logger: { info(...args: unknown[]): void; warn(...args: unknown[]): void; error(...args: unknown[]): void }
-  llm?: { registerAdapter(providers: string[], adapter: unknown): unknown }
+  llm?: {
+    registerAdapter(providers: string[], adapter: unknown): unknown
+    listModels?(provider: string): Promise<readonly { id: string }[]>
+    resolveCallConfig?(selection: SessionModelSelection, signal?: AbortSignal): Promise<unknown>
+  }
   get?(key: string): unknown
   inject?(deps: string[], fn: (ctx: Record<string, unknown>) => unknown): unknown
   effect?(fn: () => () => void): unknown
@@ -1065,12 +1069,27 @@ export function apply(
   })
   const controlsStore = acquireSessionControlsStore(dataDir)
   const agents = (): SessionControlsAgents | undefined => ctx.get?.('agents') as SessionControlsAgents | undefined
+  const listModels = ctx.llm?.listModels?.bind(ctx.llm)
+  const resolveCallConfig = ctx.llm?.resolveCallConfig?.bind(ctx.llm)
   const sessionControls = new SessionControls({
     config: cfg,
     store: controlsStore.store,
     agents,
     catalogEfforts: (model) => catalog.reasoningFor(model)?.efforts.map(({ id }) => id) ?? [],
-    warn: (error) => logger.warn('dsh-magpie-connect: failed to read or initialize session controls', error),
+    ...(listModels && resolveCallConfig && { validateSelection: async (selection, signal) => {
+      await resolveCallConfig(selection, signal)
+      // Model resolution can succeed for an existing but unlisted route. Match
+      // native selection by also requiring the exact advertised model ID.
+      const available = await listModels(selection.provider)
+      if (!available.some(({ id }) => id === selection.model)) {
+        throw new Error('Select an available model before changing its reasoning effort')
+      }
+    } }),
+    saveDefaultSelection: (selection) => {
+      const service = ctx.get?.('agentDefaultModel') as { saveSelection(selection: SessionModelSelection): Promise<void> } | undefined
+      return service?.saveSelection(selection)
+    },
+    warn: (error) => logger.warn('dsh-magpie-connect: session controls operation failed', error),
   })
   /**
    * Apply page settings to the live catalog + adapter (no restart needed).

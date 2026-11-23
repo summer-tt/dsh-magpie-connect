@@ -1,4 +1,4 @@
-import { randomUUID } from 'node:crypto'
+import { createHash, randomUUID } from 'node:crypto'
 import { closeSync, fsyncSync, mkdirSync, openSync, readFileSync, renameSync, rmSync, writeFileSync } from 'node:fs'
 import { dirname, resolve } from 'node:path'
 import {
@@ -13,16 +13,20 @@ import {
 type Route = Pick<SessionControlRoute, 'provider' | 'model'>
 export type SessionModelSelection = Route & { readonly reasoningEffort?: string }
 export type SessionControlsSelection = { speed?: SessionControlSpeed; contextWindow?: number }
-type Field = keyof SessionControlsSelection
 type SessionRoute = Route & { sessionId: string }
-type Change = SessionRoute & { field: Field; value: unknown }
+type Change = SessionRoute & { changes: Record<string, unknown>; batch: boolean; expectedRevision?: string }
 type Choice<T> = { options: readonly T[]; value: T }
 
-export interface SessionControlsView {
+type SessionControlsChoices = {
   speed?: Choice<SessionControlSpeed>
   contextWindow?: Choice<number>
   efforts?: string[]
 }
+
+export type SessionControlsView = SessionControlsChoices & (
+  | { batch: true; revision: string; reasoningEffort: string | null }
+  | { batch?: never; revision?: never; reasoningEffort?: never }
+)
 
 /** Structural subset of the DSH agent APIs used by the Host plugin. */
 export interface SessionControlsAgent {
@@ -33,7 +37,10 @@ export interface SessionControlsAgent {
     readonly header: { readonly parentSession?: string; readonly origin?: string }
     requestHeader?(): { config: SessionModelSelection } | undefined
   }
-  readonly model: { current(): Readonly<SessionModelSelection> | undefined }
+  readonly model: {
+    current(): Readonly<SessionModelSelection> | undefined
+    select?(selection: SessionModelSelection): void
+  }
   runMaintenance?<T>(task: (signal: AbortSignal) => Promise<T>): Promise<T>
 }
 
@@ -127,19 +134,24 @@ export class SessionControlsStore {
     return initial
   }
 
-  set(id: string, route: SessionControlRoute, change: RequiredChange): SessionControlsSelection {
+  peek(id: string, route: SessionControlRoute): SessionControlsSelection {
+    const state = this.#read()
+    return state.sessions[sessionRouteKey(id, route)] ?? effectiveSelection(route, state.recent[routeKey(route)])
+  }
+
+  /** Replace both preferences once and retain their previous state for synchronous compensation. */
+  set(id: string, route: SessionControlRoute, change: SessionControlsSelection): () => void {
     const state = this.#read()
     const sessionKey = sessionRouteKey(id, route)
     const recentKey = routeKey(route)
     const recent = state.recent[recentKey]
-    const current = state.sessions[sessionKey] ?? effectiveSelection(route, recent)
-    const next = { ...current, ...change }
+    const next = { ...this.peek(id, route), ...change }
     this.#replace({
       ...state,
       recent: { ...state.recent, [recentKey]: { ...recent, ...change } },
       sessions: { ...state.sessions, [sessionKey]: next },
     })
-    return next
+    return () => this.#replace(state)
   }
 }
 
@@ -181,14 +193,30 @@ class SessionControlsError extends Error {
   }
 }
 
-type RequiredChange = { speed: SessionControlSpeed } | { contextWindow: number }
+class SessionControlsUncertainError extends AggregateError {
+  constructor(errors: unknown[]) {
+    super(errors, 'Could not restore Magpie session controls after a failed save; read the session controls to confirm the current values')
+  }
+}
 
 interface SessionControlsOptions {
   config: ResolvedConfig
   store: SessionControlsStore
   agents: () => SessionControlsAgents | undefined
   catalogEfforts: (model: string) => readonly string[]
+  validateSelection?: (selection: SessionModelSelection, signal: AbortSignal) => Promise<unknown>
+  saveDefaultSelection?: (selection: SessionModelSelection) => Promise<void> | undefined
   warn: (error: unknown) => void
+}
+
+// Stable across overlapping plugin generations. Replacing an Agent or completing
+// a write invalidates its prior revision even if its choices are unchanged.
+const revisionSeeds = new WeakMap<SessionControlsAgent, string>()
+
+function revisionFor(agent: SessionControlsAgent, route: Route, view: SessionControlsChoices, reasoningEffort: string | null): string {
+  const seed = revisionSeeds.get(agent) ?? randomUUID()
+  revisionSeeds.set(agent, seed)
+  return createHash('sha256').update(JSON.stringify([seed, route.provider, route.model, view, reasoningEffort])).digest('base64url')
 }
 
 export class SessionControls {
@@ -277,9 +305,23 @@ export class SessionControls {
     return agent
   }
 
-  #view(route: SessionControlRoute | undefined, selection?: SessionControlsSelection): SessionControlsView {
-    if (!route) return {}
-    const view: SessionControlsView = {}
+  #route(request: SessionRoute): SessionControlRoute | undefined {
+    if (request.provider !== this.#options.config.providerId) return undefined
+    return this.#capabilities.get(routeKey(request)) ?? { provider: request.provider, model: request.model }
+  }
+
+  #efforts(route: SessionControlRoute): string[] {
+    const { efforts } = route
+    return this.#options.catalogEfforts(route.model).filter((effort) => efforts === undefined || efforts.includes(effort))
+  }
+
+  #supportsBatch(agent: SessionControlsAgent, route: SessionControlRoute): boolean {
+    return !!(agent.runMaintenance && agent.model.select && this.#options.validateSelection &&
+      (this.#enabled(route) || this.#efforts(route).length > 0))
+  }
+
+  #view(agent: SessionControlsAgent, route: SessionControlRoute, selection?: SessionControlsSelection): SessionControlsView {
+    const view: SessionControlsChoices = {}
     const value = effectiveSelection(route, selection)
     if (this.#options.config.sessionSpeedEnabled && route.speed && value.speed !== undefined) {
       view.speed = { options: route.speed.options, value: value.speed }
@@ -287,50 +329,145 @@ export class SessionControls {
     if (this.#options.config.sessionContextWindowEnabled && route.contextWindow && value.contextWindow !== undefined) {
       view.contextWindow = { options: route.contextWindow.options, value: value.contextWindow }
     }
-    const allowedEfforts = route.efforts
-    if (allowedEfforts !== undefined) {
-      view.efforts = this.#options.catalogEfforts(route.model).filter((effort) => allowedEfforts.includes(effort))
-    }
-    return view
+    const efforts = this.#efforts(route)
+    if (route.efforts !== undefined) view.efforts = efforts
+    if (!this.#supportsBatch(agent, route)) return view
+    const reasoningEffort = agent.model.current()?.reasoningEffort ?? null
+    return { ...view, batch: true, revision: revisionFor(agent, route, { ...view, efforts }, reasoningEffort), reasoningEffort }
   }
 
   get(request: SessionRoute): SessionControlsView {
-    this.#agentFor(request)
-    const route = this.#capabilities.get(routeKey(request))
-    const snapshot = route && this.#enabled(route) ? this.#options.store.snapshot(request.sessionId, route) : undefined
-    return this.#view(route, snapshot)
+    const agent = this.#agentFor(request)
+    const route = this.#route(request)
+    if (!route) return {}
+    const snapshot = this.#enabled(route) ? this.#options.store.snapshot(request.sessionId, route) : undefined
+    return this.#view(agent, route, snapshot)
   }
 
-  #change(request: Change): { route: SessionControlRoute; patch: RequiredChange } {
-    const route = this.#capabilities.get(routeKey(request))
-    const { field, value } = request
-    if (field === 'speed' && this.#options.config.sessionSpeedEnabled && route?.speed &&
-      isSessionControlSpeed(value) && route.speed.options.includes(value)) return { route, patch: { speed: value } }
-    if (field === 'contextWindow' && this.#options.config.sessionContextWindowEnabled && route?.contextWindow &&
-      isContextWindow(value) && route.contextWindow.options.includes(value)) return { route, patch: { contextWindow: value } }
-    throw new SessionControlsError(400, `Invalid or unavailable session control: ${field}`)
+  #change(agent: SessionControlsAgent, request: Change) {
+    const route = this.#route(request)
+    if (!route || (request.batch && !this.#supportsBatch(agent, route))) {
+      throw new SessionControlsError(400, 'Session controls are unavailable for this model')
+    }
+    const patch: SessionControlsSelection = {}
+    let nextSelection: SessionModelSelection | undefined
+    const valid = (field: string): never => {
+      throw new SessionControlsError(400, `Invalid or unavailable session control: ${field}`)
+    }
+    for (const [field, value] of Object.entries(request.changes)) {
+      switch (field) {
+        case 'speed':
+          if (!(this.#options.config.sessionSpeedEnabled && route.speed &&
+            isSessionControlSpeed(value) && route.speed.options.includes(value))) return valid(field)
+          patch.speed = value
+          break
+        case 'contextWindow':
+          if (!(this.#options.config.sessionContextWindowEnabled && route.contextWindow &&
+            isContextWindow(value) && route.contextWindow.options.includes(value))) return valid(field)
+          patch.contextWindow = value
+          break
+        case 'reasoningEffort':
+          if (agent.session.header.origin === 'subagent') {
+            throw new SessionControlsError(409, 'The session is owned by subagent routing')
+          }
+          if (!(value === null || typeof value === 'string' && this.#efforts(route).includes(value))) return valid(field)
+          nextSelection = { provider: route.provider, model: route.model, ...(value !== null && { reasoningEffort: value }) }
+          break
+        default:
+          return valid(field)
+      }
+    }
+    return { route, patch, nextSelection }
   }
 
   checkChange(request: Change) {
     const agent = this.#agentFor(request)
     if (agent.status !== 'idle') throw new SessionControlsError(409, 'The session is running')
     if (!agent.runMaintenance) throw new SessionControlsError(503, 'Session controls are unavailable')
-    this.#change(request)
+    this.#change(agent, request)
     return { agent, reserve: agent.runMaintenance.bind(agent) }
+  }
+
+  #commit(agent: SessionControlsAgent, request: Change, route: SessionControlRoute,
+    patch: SessionControlsSelection, nextSelection: SessionModelSelection | undefined): SessionControlsView {
+    const before = agent.model.current()!
+    const select = agent.model.select?.bind(agent.model)
+    const restore = Object.keys(patch).length ? this.#options.store.set(request.sessionId, route, patch) : undefined
+    // Let DSH deduplicate recorded selections. A matching current fallback
+    // still needs to be recorded when the caller requests it explicitly.
+    if (select && nextSelection) {
+      try {
+        select(nextSelection)
+        const confirmed = agent.model.current()
+        if (!sameRoute(before, confirmed) || confirmed?.reasoningEffort !== nextSelection.reasoningEffort) {
+          throw new Error('Could not confirm the native model selection')
+        }
+      } catch (error) {
+        const errors = [error]
+        try { restore?.() } catch (failure) { errors.push(failure) }
+        try {
+          // An append can fail before changing the selection. If it did change,
+          // compensate only while the selection still belongs to this batch.
+          const actual = agent.model.current()
+          if (!sameRoute(before, actual) || actual?.reasoningEffort !== before.reasoningEffort) {
+            if (sameRoute(nextSelection, actual) && actual?.reasoningEffort === nextSelection.reasoningEffort) {
+              select(before)
+            }
+            const current = agent.model.current()
+            if (!sameRoute(before, current) || current?.reasoningEffort !== before.reasoningEffort) {
+              throw new Error('Could not restore the native model selection')
+            }
+          }
+        } catch (failure) { errors.push(failure) }
+        if (errors.length > 1) throw new SessionControlsUncertainError(errors)
+        throw error
+      }
+      // Match native selectModel: default persistence is a background side effect.
+      try {
+        this.#options.saveDefaultSelection?.(nextSelection)?.catch((error) => this.#options.warn(error))
+      } catch (error) {
+        this.#options.warn(error)
+      }
+    }
+    revisionSeeds.delete(agent)
+    const snapshot = this.#enabled(route) ? this.#options.store.peek(request.sessionId, route) : undefined
+    return this.#view(agent, route, snapshot)
   }
 
   set(request: Change, requestSignal: AbortSignal, getCurrent: () => SessionControls): Promise<SessionControlsView> {
     const { agent, reserve } = this.checkChange(request)
     try {
       return reserve(async (signal) => {
-        // No yield between validation and rename. DSH model selection can
-        // change while asynchronous maintenance is waiting for I/O.
-        if (requestSignal.aborted || signal.aborted || getCurrent() !== this || this.#agentFor(request) !== agent) {
-          throw new SessionControlsError(409, 'The session or its controls changed')
+        const active = AbortSignal.any([requestSignal, signal])
+        const checkActive = () => {
+          if (active.aborted || getCurrent() !== this || this.#agentFor(request) !== agent) {
+            throw new SessionControlsError(409, 'The session or its controls changed')
+          }
         }
-        const { route, patch } = this.#change(request)
-        const value = this.#options.store.set(request.sessionId, route, patch)
-        return this.#view(route, value)
+        const view = (route: SessionControlRoute) => this.#view(agent, route,
+          this.#enabled(route) ? this.#options.store.peek(request.sessionId, route) : undefined)
+        checkActive()
+        const change = this.#change(agent, request)
+        if (request.batch) {
+          const revision = view(change.route).revision
+          if (request.expectedRevision !== undefined && request.expectedRevision !== revision) {
+            throw new SessionControlsError(409, 'The session controls changed')
+          }
+          if (change.nextSelection) {
+            try {
+              // Validate the proposed effort without materializing native default effort.
+              await this.#options.validateSelection?.(change.nextSelection, active)
+            } catch (error) {
+              checkActive()
+              throw new SessionControlsError(400, error instanceof Error ? error.message : 'Invalid session model selection')
+            }
+            checkActive()
+            if (revision !== view(change.route).revision) throw new SessionControlsError(409, 'The session controls changed')
+            this.#change(agent, request)
+          }
+        }
+        // Do not yield between the last check, preference replacement and native append.
+        return this.#commit(agent, request, change.route, change.patch, change.nextSelection)
       })
     } catch {
       // rc.5 throws synchronously when another maintenance task owns the idle phase.
@@ -353,12 +490,23 @@ function parseRoute(input: unknown): SessionRoute {
 
 function parseChange(body: unknown): Change {
   const route = parseRoute(body)
-  const { field, value } = body as Record<string, unknown>
+  const input = body as Record<string, unknown>
+  const keys = Object.keys(input).filter((key) => !allowedQuery.some((id) => id === key))
+  if (Object.hasOwn(input, 'changes')) {
+    const { changes, expectedRevision } = input
+    if (keys.some((key) => key !== 'changes' && key !== 'expectedRevision') ||
+      !isRecord(changes) || Object.keys(changes).length === 0 ||
+      (expectedRevision !== undefined && (typeof expectedRevision !== 'string' || !expectedRevision.trim()))) {
+      throw new SessionControlsError(400, 'Invalid batch session controls input')
+    }
+    return { ...route, batch: true, changes, ...(expectedRevision !== undefined && { expectedRevision }) }
+  }
+  const { field, value } = input
   if (field !== 'speed' && field !== 'contextWindow') throw new SessionControlsError(400, 'Unknown session control')
-  if (Object.keys(body as object).some((key) => key !== 'field' && key !== 'value' && !allowedQuery.some((id) => id === key))) {
+  if (keys.some((key) => key !== 'field' && key !== 'value')) {
     throw new SessionControlsError(400, 'Unexpected session control input')
   }
-  return { ...route, field, value }
+  return { ...route, batch: false, changes: { [field]: value } }
 }
 
 let writeQueue: Promise<unknown> = Promise.resolve()
@@ -390,6 +538,7 @@ export async function handleSessionControls(
   } catch (error) {
     if (error instanceof SessionControlsError) return reply(error.status, { ok: false, error: error.message })
     warn(error)
-    return reply(500, { ok: false, error: 'Could not read or save Magpie session controls' })
+    return reply(500, { ok: false, error: error instanceof SessionControlsUncertainError
+      ? error.message : 'Could not read or save Magpie session controls' })
   }
 }
