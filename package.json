@@ -6,7 +6,7 @@
   "type": "module",
   "repository": {
     "type": "git",
-    "url": "https://github.com/bitxeno/dsh-magpie-connect.git"
+    "url": "https://github.com/summer-tt/dsh-magpie-connect.git"
   },
   "main": "lib/index.js",
   "exports": {
