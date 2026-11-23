@@ -13,6 +13,24 @@
  */
 import { dshHomePath } from './homeDir.ts'
 import type { MagpieSearchMode } from './settings.ts'
+
+export const SESSION_CONTROL_SPEEDS = ['standard', 'fast', 'ultrafast'] as const
+export type SessionControlSpeed = (typeof SESSION_CONTROL_SPEEDS)[number]
+
+export interface SessionControlOptions<T> {
+  readonly options: readonly T[]
+  readonly default: T
+}
+
+export interface SessionControlRoute {
+  readonly provider: string
+  readonly model: string
+  readonly speed?: SessionControlOptions<SessionControlSpeed>
+  readonly contextWindow?: SessionControlOptions<number>
+  /** Optional allowlist applied to this route's catalog reasoning efforts. */
+  readonly efforts?: readonly string[]
+}
+
 export interface DshMagpieConnectConfig {
   /**
    * Provider route id registered into DSH (the grouping key in the model
@@ -73,6 +91,91 @@ export interface DshMagpieConnectConfig {
   searchMaxUses?: number
   /** 单次网页搜索请求超时（毫秒，默认 120000）。 */
   searchTimeoutMs?: number
+  /** Enable per-session request speed on supported routes. Defaults to true. */
+  sessionSpeedEnabled?: boolean
+  /** Enable per-session context budgets on supported routes. Defaults to true. */
+  sessionContextWindowEnabled?: boolean
+  /** Exact provider/model capabilities. An explicit list replaces the built-in routes. */
+  sessionControlRoutes?: readonly SessionControlRoute[]
+}
+
+const defaultSessionControlRoutes: readonly SessionControlRoute[] = [
+  'codex/gpt-6.2-sol',
+  'codex/gpt-6.2-astra',
+].map((model) => ({
+  provider: 'magpie',
+  model,
+  speed: { options: SESSION_CONTROL_SPEEDS, default: 'fast' },
+  contextWindow: { options: [272_000, 500_000, 872_000], default: 500_000 },
+}))
+
+export function isSessionControlSpeed(value: unknown): value is SessionControlSpeed {
+  return SESSION_CONTROL_SPEEDS.some((speed) => speed === value)
+}
+
+export function isContextWindow(value: unknown): value is number {
+  return typeof value === 'number' && Number.isSafeInteger(value) && value > 0
+}
+
+function isNonemptyString(value: unknown): value is string {
+  return typeof value === 'string' && value.trim() !== ''
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null && !Array.isArray(value)
+}
+
+function validOptions<T>(value: unknown, valid: (item: unknown) => item is T): value is SessionControlOptions<T> {
+  if (!isRecord(value) || !Array.isArray(value.options)) return false
+  const { options } = value
+  return options.length > 0 && [...options].every(valid) && new Set(options).size === options.length &&
+    valid(value.default) && options.includes(value.default)
+}
+
+function validateSessionControlConfig(config: DshMagpieConnectConfig): void {
+  for (const key of ['sessionSpeedEnabled', 'sessionContextWindowEnabled'] as const) {
+    if (config[key] !== undefined && typeof config[key] !== 'boolean') throw new Error(`${key} must be a boolean`)
+  }
+  const routes = config.sessionControlRoutes
+  if (routes === undefined) return
+  if (!Array.isArray(routes)) throw new Error('sessionControlRoutes must be an array')
+  const seen = new Set<string>()
+  for (const [index, route] of routes.entries()) {
+    const key = `sessionControlRoutes[${index}]`
+    if (!isRecord(route) || !isNonemptyString(route.provider) || !isNonemptyString(route.model)) {
+      throw new Error(`${key} must specify a provider and model`)
+    }
+    const id = JSON.stringify([route.provider, route.model])
+    if (seen.has(id)) throw new Error(`${key} duplicates the provider/model route`)
+    seen.add(id)
+    if (route.speed !== undefined && !validOptions(route.speed, isSessionControlSpeed)) {
+      throw new Error(`${key}.speed needs distinct speed options and a default included in them`)
+    }
+    if (route.contextWindow !== undefined && !validOptions(route.contextWindow, isContextWindow)) {
+      throw new Error(`${key}.contextWindow needs distinct positive integer options and a default included in them`)
+    }
+    if (route.efforts !== undefined && (!Array.isArray(route.efforts) || ![...route.efforts].every(isNonemptyString))) {
+      throw new Error(`${key}.efforts must be an array of nonempty strings`)
+    }
+  }
+}
+
+/** Cordis Standard Schema. Existing settings still use their original normalization. */
+export const Config = {
+  '~standard': {
+    version: 1 as const,
+    vendor: 'dsh-magpie-connect',
+    validate(value: unknown): { value: DshMagpieConnectConfig } | { issues: { message: string }[] } {
+      if (value === undefined) return { value: {} }
+      if (!isRecord(value)) return { issues: [{ message: 'Expected a Magpie configuration object' }] }
+      try {
+        validateSessionControlConfig(value)
+        return { value }
+      } catch (error) {
+        return { issues: [{ message: error instanceof Error ? error.message : String(error) }] }
+      }
+    },
+  },
 }
 
 export const defaults = {
@@ -89,17 +192,19 @@ export const defaults = {
   searchModel: '',
   searchMaxUses: 5,
   searchTimeoutMs: 120_000,
+  sessionSpeedEnabled: true,
+  sessionContextWindowEnabled: true,
+  sessionControlRoutes: defaultSessionControlRoutes,
 } as const
 
-export type ResolvedConfig = Required<
-  Pick<
-    DshMagpieConnectConfig,
-    'providerId' | 'refreshSeconds' | 'searchMode' | 'searchModel' | 'searchMaxUses' | 'searchTimeoutMs'
-  >
-> &
+type RequiredConfig = 'providerId' | 'refreshSeconds' | 'searchMode' | 'searchModel' | 'searchMaxUses' | 'searchTimeoutMs'
+  | 'sessionSpeedEnabled' | 'sessionContextWindowEnabled' | 'sessionControlRoutes'
+
+export type ResolvedConfig = Required<Pick<DshMagpieConnectConfig, RequiredConfig>> &
   DshMagpieConnectConfig & { displayName: string; baseUrl: string; apiKey: string; dataDir: string }
 
 export function resolveConfig(config: DshMagpieConnectConfig = {}): ResolvedConfig {
+  validateSessionControlConfig(config)
   const providerId = config.providerId ?? defaults.providerId
   return {
     ...defaults,
@@ -119,5 +224,8 @@ export function resolveConfig(config: DshMagpieConnectConfig = {}): ResolvedConf
       typeof config.searchTimeoutMs === 'number' && Number.isFinite(config.searchTimeoutMs) && config.searchTimeoutMs > 0
         ? Math.floor(config.searchTimeoutMs)
         : defaults.searchTimeoutMs,
+    sessionSpeedEnabled: config.sessionSpeedEnabled ?? defaults.sessionSpeedEnabled,
+    sessionContextWindowEnabled: config.sessionContextWindowEnabled ?? defaults.sessionContextWindowEnabled,
+    sessionControlRoutes: config.sessionControlRoutes ?? defaults.sessionControlRoutes,
   }
 }

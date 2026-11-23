@@ -19,6 +19,11 @@
 # - apiKey:  gateway credential (required, even if /models needs none).
 # - dataDir: plugin state dir (status snapshot, settings file, catalog cache);
 #   defaults to $DSH_HOME/storages/magpie-connect.
+# - sessionSpeedEnabled / sessionContextWindowEnabled: independent per-session
+#   controls, each enabled by default. Disabling one preserves saved choices.
+# - sessionControlRoutes: exact provider/model capabilities. An explicit list
+#   replaces the built-in Magpie routes. Each route can define speed and
+#   contextWindow as { options, default }, and an optional efforts allowlist.
 # - displayName: cosmetic label in the model picker (route id stays providerId).
 # - providerId:  RENAME the route id itself (existing sessions pointing at the
 #   old id will orphan — prefer displayName for a cosmetic rename).

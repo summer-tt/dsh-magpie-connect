@@ -70,8 +70,56 @@ export interface CatalogLike {
   maxTokensFor?(model: string): number
 }
 
+interface SessionControls {
+  speed?: 'standard' | 'fast' | 'ultrafast'
+  contextWindow?: number
+}
+
+export interface MagpieAdapterOptions {
+  magpieBaseUrl?: string
+  baseUrl?: string
+  providerOverride?: unknown
+  /** Route id registered into DSH (model `provider` field + pi-ai provider tag). */
+  providerId?: string
+  /** Display name reported via providerInfo (model picker grouping label). */
+  displayName?: string
+  /** Gateway credential (the gateway needs none). */
+  apiKey?: string
+  /** Live endpoint read per request, with the static endpoint as fallback. */
+  runtime?: RuntimeEndpoint
+  /** Connection-setup retries for 429/5xx (default 2). */
+  maxRetries?: number
+  /** Overall SDK request cap in ms (default 300000). */
+  timeoutMs?: number
+  /** Stall watchdog: max wait for the first upstream event in ms (default 90000; <=0 disables). */
+  firstEventTimeoutMs?: number
+  /** Stall watchdog: max silence between upstream events in ms (default 60000; <=0 disables). */
+  idleTimeoutMs?: number
+  /** Harness attachment service for image bytes. */
+  resolveAttachments?: () => AttachmentStore | undefined
+  /** The Host initiator supplies session identity during model resolution and call preparation. */
+  resolveInitiatorSessionId?: () => string | undefined
+  /** Missing controls preserve the catalog limits or the gateway's speed default. */
+  resolveSessionControls?: (provider: string, model: string, sessionId?: string) => SessionControls
+  /** Optional reasoning-effort filter for this exact route. */
+  resolveAllowedEfforts?: (provider: string, model: string) => readonly string[] | undefined
+  /** An existing explicit selection may stay valid for its initiating Agent. */
+  resolveInitiatorReasoningEffort?: (provider: string, model: string) => string | undefined
+}
+
+interface CallSnapshot {
+  readonly sessionId: string | undefined
+  readonly contextWindow: number
+  readonly maxTokens: number
+  readonly speed: SessionControls['speed']
+}
+
 const DEFAULT_CONTEXT_WINDOW = 262144
 const DEFAULT_MAX_TOKENS = 32768
+const SERVICE_TIERS: Partial<Record<NonNullable<SessionControls['speed']>, string>> = {
+  fast: 'priority',
+  ultrafast: 'ultrafast',
+}
 
 /** Match Magpie's DSH defaults: reserve reply space without exhausting the compaction budget. */
 function requestDefaultMaxTokens(contextWindow: number, outputLimit: number): number {
@@ -157,16 +205,13 @@ function toPiModel(
   baseUrl: string,
   id: string,
   catalog: CatalogLike,
-  contextWindow = DEFAULT_CONTEXT_WINDOW,
-  maxTokens = DEFAULT_MAX_TOKENS,
+  { contextWindow, maxTokens }: Pick<CallSnapshot, 'contextWindow' | 'maxTokens'>,
 ): Model<Api> {
   const endpoints = catalog.getEntry?.(id)?.nativeEndpoints ?? []
   const api = modelApiForEntry(endpoints)
   const entryThinks = catalog.thinks?.(id) ?? api === 'openai-responses'
   const ladder = catalog.reasoningFor?.(id)
   const ladderIds = ladder?.efforts.map((effort) => effort.id)
-  const resolvedContext = catalog.contextWindowFor?.(id) ?? contextWindow
-  const resolvedMax = catalog.maxTokensFor?.(id) ?? maxTokens
   if (api === 'openai-responses') {
     return {
       id,
@@ -178,8 +223,8 @@ function toPiModel(
       thinkingLevelMap: thinkingLevelMapFor(ladderIds),
       input: catalog.supportsImage?.(id) ?? true ? ['text', 'image'] : ['text'],
       cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
-      contextWindow: resolvedContext,
-      maxTokens: resolvedMax,
+      contextWindow,
+      maxTokens,
     }
   }
   const wire: Model<Api> = {
@@ -191,8 +236,8 @@ function toPiModel(
     reasoning: entryThinks,
     input: catalog.supportsImage?.(id) ?? false ? ['text', 'image'] : ['text'],
     cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
-    contextWindow: resolvedContext,
-    maxTokens: resolvedMax,
+    contextWindow,
+    maxTokens,
   }
   if (entryThinks) wire.thinkingLevelMap = thinkingLevelMapFor(ladderIds)
   return wire
@@ -212,36 +257,12 @@ export class MagpieAdapter {
   readonly #firstEventTimeoutMs: number
   readonly #idleTimeoutMs: number
   readonly #resolveAttachments?: () => AttachmentStore | undefined
+  readonly #resolveInitiatorSessionId?: MagpieAdapterOptions['resolveInitiatorSessionId']
+  readonly #resolveSessionControls?: MagpieAdapterOptions['resolveSessionControls']
+  readonly #resolveAllowedEfforts?: MagpieAdapterOptions['resolveAllowedEfforts']
+  readonly #resolveInitiatorReasoningEffort?: MagpieAdapterOptions['resolveInitiatorReasoningEffort']
 
-  constructor(
-    catalog: CatalogLike,
-    options: {
-      magpieBaseUrl?: string
-      baseUrl?: string
-      providerOverride?: unknown
-      /** Route id registered into DSH (model `provider` field + pi-ai provider tag). */
-      providerId?: string
-      /** Display name reported via providerInfo (model picker grouping label). */
-      displayName?: string
-      /** Gateway credential (the gateway needs none). */
-      apiKey?: string
-      /**
-       * Live endpoint read per request (settings page). Falls back to the
-       * static `magpieBaseUrl`/`apiKey` options when absent.
-       */
-      runtime?: RuntimeEndpoint
-      /** Connection-setup retries for 429/5xx (default 2). */
-      maxRetries?: number
-      /** Overall SDK request cap in ms (default 300000). */
-      timeoutMs?: number
-      /** Stall watchdog: max wait for the first upstream event in ms (default 90000; <=0 disables). */
-      firstEventTimeoutMs?: number
-      /** Stall watchdog: max silence between upstream events in ms (default 60000; <=0 disables). */
-      idleTimeoutMs?: number
-      /** Harness attachment service for image bytes (wired in index.ts). */
-      resolveAttachments?: () => AttachmentStore | undefined
-    } = {},
-  ) {
+  constructor(catalog: CatalogLike, options: MagpieAdapterOptions = {}) {
     this.#catalog = catalog
     this.#providerId = options.providerId ?? PROVIDER_ID
     this.#displayName = options.displayName ?? (options.providerId ?? DEFAULT_DISPLAY_NAME)
@@ -257,6 +278,10 @@ export class MagpieAdapter {
     this.#firstEventTimeoutMs = options.firstEventTimeoutMs ?? DEFAULT_FIRST_EVENT_TIMEOUT_MS
     this.#idleTimeoutMs = options.idleTimeoutMs ?? DEFAULT_IDLE_TIMEOUT_MS
     this.#resolveAttachments = options.resolveAttachments
+    this.#resolveInitiatorSessionId = options.resolveInitiatorSessionId
+    this.#resolveSessionControls = options.resolveSessionControls
+    this.#resolveAllowedEfforts = options.resolveAllowedEfforts
+    this.#resolveInitiatorReasoningEffort = options.resolveInitiatorReasoningEffort
     if (options.providerOverride !== undefined) {
       this.#provider = options.providerOverride as never
       return
@@ -328,9 +353,42 @@ export class MagpieAdapter {
     return models
   }
 
-  resolveModel(
+  #captureCall(provider: string, model: string, sessionId: string | undefined): CallSnapshot {
+    const controls = this.#resolveSessionControls?.(provider, model, sessionId)
+    return {
+      sessionId,
+      speed: controls?.speed,
+      contextWindow: controls?.contextWindow ?? this.#catalog.contextWindowFor?.(model) ?? DEFAULT_CONTEXT_WINDOW,
+      maxTokens: this.#catalog.maxTokensFor?.(model) ?? DEFAULT_MAX_TOKENS,
+    }
+  }
+
+  resolveModel(provider: string, model: string) {
+    const snapshot = this.#captureCall(provider, model, this.#resolveInitiatorSessionId?.())
+    return this.#resolveModel(provider, model, snapshot)
+  }
+
+  #resolveReasoning(provider: string, model: string, existingEffort?: string) {
+    const ladder = this.#catalog.reasoningFor?.(model)
+    const allowed = this.#resolveAllowedEfforts?.(provider, model)
+    if (ladder === undefined || allowed === undefined) return ladder
+
+    const available = ladder.efforts.filter(({ id }) => allowed.includes(id))
+    const defaultEffort = available.some(({ id }) => id === ladder.defaultEffort) ? ladder.defaultEffort : available[0]?.id
+    // DSH validates an existing selection again at call preparation. Retain
+    // its exact, still-supported effort without advertising it for new picks.
+    const efforts = existingEffort === undefined
+      ? available
+      : ladder.efforts.filter(({ id }) => id === existingEffort || allowed.includes(id))
+    if (efforts.length === 0) return undefined
+    return { efforts, ...(defaultEffort === undefined ? {} : { defaultEffort }) }
+  }
+
+  #resolveModel(
     provider: string,
     model: string,
+    { contextWindow, maxTokens }: CallSnapshot,
+    existingEffort?: string,
   ): {
     provider: string
     id: string
@@ -349,15 +407,14 @@ export class MagpieAdapter {
     // planReasoningEffort (gateway extensions `none`/`ultra` included).
     // No `off` entry: omission keeps the gateway default (= defaultEffort).
     const image = this.#catalog.supportsImage?.(model) ?? this.#catalog.requiresResponsesApi?.(model) ?? false
-    const ladder = this.#catalog.reasoningFor?.(model)
-    const contextWindow = this.#catalog.contextWindowFor?.(model) ?? DEFAULT_CONTEXT_WINDOW
+    const ladder = this.#resolveReasoning(provider, model, existingEffort)
     return {
       provider,
       id: model,
       name: this.#labelFor(model),
       inputModalities: image ? ['text', 'image'] : ['text'],
       context: { contextWindow },
-      defaultMaxTokens: requestDefaultMaxTokens(contextWindow, this.#catalog.maxTokensFor?.(model) ?? DEFAULT_MAX_TOKENS),
+      defaultMaxTokens: requestDefaultMaxTokens(contextWindow, maxTokens),
       ...(ladder !== undefined ? { reasoning: ladder } : {}),
     }
   }
@@ -370,9 +427,19 @@ export class MagpieAdapter {
     model: ReturnType<MagpieAdapter['resolveModel']>
     stream: (options: HarnessGenerateOptions) => AsyncGenerator<HarnessChunk>
   }> {
+    const snapshot = this.#captureCall(provider, model, this.#resolveInitiatorSessionId?.())
+    const existingEffort = this.#resolveInitiatorReasoningEffort?.(provider, model)
     return {
-      model: this.resolveModel(provider, model),
-      stream: (options) => this.stream(options),
+      model: this.#resolveModel(provider, model, snapshot, existingEffort),
+      stream: (options) => {
+        // The Host only supplies the explicit session ID at dispatch. Manual
+        // compaction can run outside its session's initiator scope.
+        const sessionId = options.sessionId ?? snapshot.sessionId
+        if (sessionId !== snapshot.sessionId || provider !== options.provider || model !== options.model) {
+          return this.#stream(options, this.#captureCall(options.provider, options.model, sessionId))
+        }
+        return this.#stream(options, snapshot)
+      },
     }
   }
 
@@ -394,6 +461,11 @@ export class MagpieAdapter {
     return this.#runtime?.apiKey() ?? this.#fallbackApiKey
   }
 
+  async *stream(options: HarnessGenerateOptions): AsyncGenerator<HarnessChunk> {
+    const sessionId = options.sessionId ?? this.#resolveInitiatorSessionId?.()
+    yield* this.#stream(options, this.#captureCall(options.provider, options.model, sessionId))
+  }
+
   /**
    * Stream one chat turn from the Magpie gateway: a single pi-ai stream,
    * translated to harness chunks verbatim. Upstream failures (rate limit,
@@ -404,7 +476,7 @@ export class MagpieAdapter {
    * the upstream is aborted and the turn ends fast with a TIMEOUT error
    * instead of hanging to the SDK/harness timeout.
    */
-  async *stream(options: HarnessGenerateOptions): AsyncGenerator<HarnessChunk> {
+  async *#stream(options: HarnessGenerateOptions, snapshot: CallSnapshot): AsyncGenerator<HarnessChunk> {
     const baseUrl = this.#requireBaseUrl()
     const endpoints = this.#catalog.getEntry?.(options.model)?.nativeEndpoints ?? []
     const hasImage = contentHasImage(options.messages)
@@ -414,7 +486,7 @@ export class MagpieAdapter {
     const context = hasImage
       ? await this.#imageContext(options, endpoints)
       : toPiContext(options, endpoints)
-    const model = toPiModel(this.#providerId, baseUrl, options.model, this.#catalog)
+    const model = toPiModel(this.#providerId, baseUrl, options.model, this.#catalog, snapshot)
     // Linked controller: the watchdog aborts the upstream on stall, while a
     // harness abort (user stop / host timeout) still propagates through.
     const controller = new AbortController()
@@ -426,7 +498,7 @@ export class MagpieAdapter {
     }
     try {
       const events = withStallTimeout(
-        this.#eventsFor(options, context, model, controller.signal) as AsyncIterable<PiEvent>,
+        this.#eventsFor(options, context, model, controller.signal, snapshot.speed),
         { firstEventTimeoutMs: this.#firstEventTimeoutMs, idleTimeoutMs: this.#idleTimeoutMs },
         { model: options.model, onTimeout: () => controller.abort() },
       )
@@ -449,7 +521,8 @@ export class MagpieAdapter {
     context: ReturnType<typeof toPiContext>,
     model: ReturnType<typeof toPiModel>,
     signal: AbortSignal,
-  ): unknown {
+    speed: SessionControls['speed'],
+  ): AsyncIterable<PiEvent> {
     // Single dispatch through `provider.stream` with our own clamped effort:
     // gateway extensions (`none`/`ultra`) ride verbatim, known levels ride
     // the ladder, and omission keeps the gateway default.
@@ -462,6 +535,8 @@ export class MagpieAdapter {
     // ("OpenAI/JS 6.26.0"), and the gateway's DSH-specific views
     // (the `agent == "dsh"` ones) never see them as DSH's.
     const sessionId = typeof options.sessionId === 'string' ? options.sessionId : undefined
+    // Auxiliary requests keep the gateway's original speed policy.
+    const serviceTier = options.purpose === undefined && speed !== undefined ? SERVICE_TIERS[speed] : undefined
     return this.#provider.stream(model, context as unknown as Context, {
       apiKey: this.#wireApiKey(),
       signal,
@@ -470,6 +545,11 @@ export class MagpieAdapter {
       temperature: options.temperature,
       maxTokens: options.maxTokens ?? requestDefaultMaxTokens(model.contextWindow, model.maxTokens),
       ...(reasoningEffort !== undefined ? { reasoningEffort } : {}),
+      // Both serializers expose the final payload here. Chat Completions does
+      // not handle pi-ai's serviceTier option or its gateway-specific values.
+      ...(serviceTier === undefined ? {} : {
+        onPayload: (payload: object) => ({ ...payload, service_tier: serviceTier }),
+      }),
       headers: {
         'user-agent': DSH_USER_AGENT,
         // The session id rides the same header Magpie's `/v1/magpie/route`

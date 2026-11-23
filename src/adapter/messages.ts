@@ -58,6 +58,8 @@ export interface HarnessGenerateOptions {
   temperature?: number
   reasoningEffort?: string
   signal?: AbortSignal
+  /** Session identity attached by the loop or an auxiliary request producer. */
+  sessionId?: string
   /** Declared auxiliary request purpose (e.g. `compaction`); absent for ordinary turns. */
   purpose?: string
   [key: string]: unknown

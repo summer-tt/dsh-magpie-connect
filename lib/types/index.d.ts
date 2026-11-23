@@ -1,5 +1,6 @@
 import { ModelCatalog } from './adapter/catalog.ts';
 import { type DshMagpieConnectConfig } from './config.ts';
+import { SessionControls } from './session-controls.ts';
 import { SettingsStore, type EffectiveSearchSettings } from './settings.ts';
 /**
  * dsh-magpie-connect DSH cordis plugin entry.
@@ -41,6 +42,7 @@ export declare const inject: readonly ["llm"];
 /** Browser-facing REST root for the settings page (served under the shared /api channel). */
 export declare const SETTINGS_API = "/api/magpie-settings";
 export declare const MODELS_API = "/api/magpie-models";
+export declare const SESSION_CONTROLS_API = "/api/magpie-session-controls";
 export declare const TEST_API = "/api/magpie-test";
 /**
  * Candidate discovery: asks the endpoint the form currently shows (including a
@@ -69,6 +71,7 @@ export interface WebSearchBindingState {
 /** Backend generation behind the shared settings routes (newest wins). */
 export interface SettingsBackend {
     store: SettingsStore;
+    sessionControls: SessionControls;
     catalog: ModelCatalog;
     patchEndpoint: {
         baseUrl: string;
@@ -124,4 +127,4 @@ export { MagpieAdapter } from './adapter/magpie-adapter.ts';
 export { ModelCatalog } from './adapter/catalog.ts';
 export { MagpieSearchProvider, MagpieSearchError, mapAnthropicSearchResponse, parseMagpieMcpSearchText, searchViaMagpieMcp, searchViaMagpieModel, } from './search.ts';
 export { SettingsStore, isConfigured, resolveEffectiveEndpoint, resolveEffectiveSearchSettings, type MagpieSearchMode, } from './settings.ts';
-export { resolveConfig, type DshMagpieConnectConfig, } from './config.ts';
+export { Config, resolveConfig, type DshMagpieConnectConfig, } from './config.ts';

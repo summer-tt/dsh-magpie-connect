@@ -12,6 +12,15 @@ import { legacyDataDir } from './homeDir.ts'
 import { MagpieAdapter } from './adapter/magpie-adapter.ts'
 import type { AttachmentStore } from './adapter/messages.ts'
 import { resolveConfig, type DshMagpieConnectConfig } from './config.ts'
+import {
+  SessionControls,
+  acquireSessionControlsStore,
+  handleSessionControls,
+  type SessionControlsAgent,
+  type SessionControlsAgents,
+  type SessionControlsCreated,
+  type SessionModelSelection,
+} from './session-controls.ts'
 import { deriveGatewayBase, fetchTraceView, fetchWebIcon, TRACE_TIMEOUT_MS } from './trace.ts'
 import {
   MagpieSearchProvider,
@@ -71,6 +80,7 @@ export const inject = ['llm'] as const
 /** Browser-facing REST root for the settings page (served under the shared /api channel). */
 export const SETTINGS_API = '/api/magpie-settings'
 export const MODELS_API = '/api/magpie-models'
+export const SESSION_CONTROLS_API = '/api/magpie-session-controls'
 export const TEST_API = '/api/magpie-test'
 /**
  * Candidate discovery: asks the endpoint the form currently shows (including a
@@ -113,6 +123,7 @@ export interface WebSearchBindingState {
 /** Backend generation behind the shared settings routes (newest wins). */
 export interface SettingsBackend {
   store: SettingsStore
+  sessionControls: SessionControls
   catalog: ModelCatalog
   patchEndpoint: { baseUrl: string; apiKey: string }
   patchSearch: EffectiveSearchSettings
@@ -602,13 +613,21 @@ async function handleSearchTestPost(request: Request): Promise<Response> {
   }
 }
 
-function routeDefinitions(): RouteDefinition[] {
+function routeDefinitions(logger: PluginContext['logger']): RouteDefinition[] {
   return [
     {
       path: SETTINGS_API,
       methods: ['GET', 'POST'],
       requestBody: 'buffered',
       fetch: (request: Request) => (request.method === 'POST' ? handleSettingsPost(request) : handleSettingsGet()),
+    },
+    {
+      path: SESSION_CONTROLS_API,
+      methods: ['GET', 'POST'],
+      requestBody: 'buffered',
+      fetch: (request) => handleSessionControls(request, () => backendOrThrow().sessionControls, (error) => {
+        logger.warn('dsh-magpie-connect: session controls request failed', error)
+      }),
     },
     {
       path: MODELS_API,
@@ -676,7 +695,7 @@ function installSettingsRoutes(
         if (routeDisposers === null) {
           const installed: Array<() => void | Promise<void>> = []
           try {
-            for (const definition of routeDefinitions()) {
+            for (const definition of routeDefinitions(logger)) {
               try {
                 installed.push(register(definition))
               } catch (error) {
@@ -1044,6 +1063,15 @@ export function apply(
     },
     onInvalidate: announceTopology,
   })
+  const controlsStore = acquireSessionControlsStore(dataDir)
+  const agents = (): SessionControlsAgents | undefined => ctx.get?.('agents') as SessionControlsAgents | undefined
+  const sessionControls = new SessionControls({
+    config: cfg,
+    store: controlsStore.store,
+    agents,
+    catalogEfforts: (model) => catalog.reasoningFor(model)?.efforts.map(({ id }) => id) ?? [],
+    warn: (error) => logger.warn('dsh-magpie-connect: failed to read or initialize session controls', error),
+  })
   /**
    * Apply page settings to the live catalog + adapter (no restart needed).
    *
@@ -1072,6 +1100,22 @@ export function apply(
     timeoutMs: cfg.timeoutMs,
     firstEventTimeoutMs: cfg.firstEventTimeoutMs,
     idleTimeoutMs: cfg.idleTimeoutMs,
+    resolveInitiatorSessionId: () => {
+      try {
+        return agents()?.currentInitiator?.()?.session.id
+      } catch {
+        return undefined
+      }
+    },
+    resolveSessionControls: (provider, model, sessionId) => sessionControls.resolve(provider, model, sessionId),
+    resolveAllowedEfforts: (provider: string, model: string) => sessionControls.allowedEfforts(provider, model),
+    resolveInitiatorReasoningEffort: (provider: string, model: string) => {
+      try {
+        return sessionControls.initiatorReasoningEffort(provider, model)
+      } catch {
+        return undefined
+      }
+    },
     runtime: {
       baseUrl: () => {
         const endpoint = effective()
@@ -1157,6 +1201,7 @@ export function apply(
   // when an older generation installed the routes.
   currentBackend = {
     store,
+    sessionControls,
     catalog,
     patchEndpoint,
     patchSearch,
@@ -1170,6 +1215,23 @@ export function apply(
     restoreWebSearchProvider,
   }
 
+  if (cfg.sessionSpeedEnabled || cfg.sessionContextWindowEnabled) {
+    ctx.on?.('agent/created', (created: SessionControlsCreated) => {
+      if (currentBackend?.sessionControls === sessionControls) sessionControls.onCreated(created)
+    })
+  }
+  if (cfg.sessionSpeedEnabled || cfg.sessionContextWindowEnabled || cfg.sessionControlRoutes.some((route) => route.efforts !== undefined)) {
+    ctx.on?.('agent/pre-step', (
+      { agent, modelSelection }: { agent: SessionControlsAgent; modelSelection: SessionModelSelection },
+      next: () => unknown,
+    ) => {
+      sessionControls.observeStep(agent, modelSelection)
+      return next()
+    })
+    ctx.on?.('agent/status', ({ agent, status }: { agent: SessionControlsAgent; status: string }) => {
+      if (status === 'idle') sessionControls.observeIdle(agent)
+    })
+  }
   installSettingsRoutes(ctx, logger)
   installSearchProvider(ctx, logger, {
     id: cfg.providerId,
@@ -1207,6 +1269,7 @@ export function apply(
   if (typeof maybeEffect === 'function') {
     maybeEffect.call(ctx, () => () => {
       catalog.stop()
+      controlsStore.release()
     })
   }
   return { ready }
@@ -1230,6 +1293,7 @@ export {
   type MagpieSearchMode,
 } from './settings.ts'
 export {
+  Config,
   resolveConfig,
   type DshMagpieConnectConfig,
 } from './config.ts'
