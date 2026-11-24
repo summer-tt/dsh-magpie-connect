@@ -386,10 +386,10 @@ function batchFixture(path: string, config: DshMagpieConnectConfig = {}, validat
   return result
 }
 
-function batchRequest(changes: unknown, expectedRevision?: string, route: Route = sol, sessionId = 'target'): Request {
+function batchRequest(changes: unknown, expectedRevision?: string, route: Route = sol, sessionId = 'target', allowRunning?: true): Request {
   return new Request(`http://localhost${SESSION_CONTROLS_API}`, {
     method: 'POST', headers: { 'content-type': 'application/json' },
-    body: JSON.stringify({ sessionId, ...route, changes, expectedRevision }),
+    body: JSON.stringify({ sessionId, ...route, changes, expectedRevision, allowRunning }),
   })
 }
 
@@ -402,6 +402,83 @@ async function batchView(f: ReturnType<typeof batchFixture>) {
   assert.equal(typeof value.revision, 'string')
   return value
 }
+
+test('running POST bypasses legacy validation and a restored shrink is checked once with a bounded fallback', async (t) => {
+  let inputTokens = 250_000
+  let initiator: SessionControlsAgent | undefined
+  const f = batchFixture(statePath(t))
+  const makeControls = (store: SessionControlsStore) => new SessionControls({
+    config: resolveConfig({ providerId: 'magpie' }),
+    store,
+    agents: () => ({ get: (id) => f.agents.get(id), currentInitiator: () => initiator }),
+    catalogEfforts: () => ['medium', 'high'],
+    catalogHasModel: (model) => model === sol.model,
+    validateSelection: async () => assert.fail('running POST called the asynchronous validator'),
+    requestMarker: () => (request) => request === main,
+    tokenMeter: () => ({ measure: () => ({ totalTokens: inputTokens }) }),
+    warn: (error) => f.warnings.push(error),
+  })
+  const agent = f.agent
+  const signal = new AbortController().signal
+  const at = { agent, turn: 1, step: 2, signal }
+  let main = { ...sol, sessionId: agent.id, signal, maxTokens: 40_000 }
+  const controls = makeControls(f.store)
+  const saving = { ...f, controls }
+  const initial = await batchView(saving)
+  assert.equal(initial.runningEdits, true)
+  agent.status = 'running'
+  const edit = { speed: 'ultrafast', contextWindow: 272_000, reasoningEffort: 'high' }
+  assert.equal((await send(saving, batchRequest(edit, initial.revision))).status, 409)
+  const reply = await send(saving, batchRequest(edit, initial.revision, sol, agent.id, true))
+  assert.equal(reply.status, 200)
+  const { value: saved } = await reply.json()
+  assert.equal(saved.contextWindow.value, 500_000)
+  assert.equal(saved.pendingWindow.target, 272_000)
+  assert.equal(saved.reasoningEffort, 'high')
+  assert.equal((await send(saving, batchRequest(edit, initial.revision, sol, agent.id, true))).status, 409)
+
+  const restarted = makeControls(new SessionControlsStore(f.store.path))
+  assert.deepEqual((await batchView({ ...f, controls: restarted })).pendingWindow, saved.pendingWindow)
+  agent.session.requestHeader = () => ({ config: { ...sol, maxTokens: main.maxTokens } })
+  initiator = agent
+  restarted.observeStep(agent, agent.selected, at)
+  assert.equal(restarted.resolve(sol.provider, sol.model, agent.id, signal).contextWindow, 272_000)
+  assert.equal(restarted.resolve(sol.provider, sol.model, agent.id, signal, 'prepare').contextWindow, 500_000)
+  restarted.prepareMainRequest(at)
+  const candidate = restarted.resolve(sol.provider, sol.model, agent.id, signal, 'prepare')
+  assert.equal(candidate.canDispatch?.(), false)
+  const sent = async function* () { yield 'upstream' }
+  async function collect<T>(stream: AsyncIterable<T>): Promise<T[]> {
+    const chunks: T[] = []
+    for await (const chunk of stream) chunks.push(chunk)
+    return chunks
+  }
+  assert.deepEqual(await collect(restarted.guardStream({ ...main }, sent)), ['upstream'])
+  const [finish] = await collect(restarted.guardStream(main, sent))
+  if (!finish || typeof finish === 'string') assert.fail('over-budget candidate reached upstream')
+  assert.equal(candidate.canDispatch?.(), false)
+  const retry = { ...at, provider: sol.provider, failure: finish.reason.failure }
+  assert.deepEqual(restarted.retryWindow(retry), { kind: 'retry' })
+  assert.equal(restarted.retryWindow(retry), undefined)
+  restarted.prepareMainRequest(at)
+  const retained = restarted.resolve(sol.provider, sol.model, agent.id, signal, 'prepare')
+  assert.equal(retained.contextWindow, 500_000)
+  assert.equal(retained.speed, 'ultrafast')
+  main = { ...main, maxTokens: 100_000 }
+  assert.deepEqual(await collect(restarted.guardStream(main, sent)), ['upstream'])
+  assert.equal(retained.canDispatch?.(), true)
+  const view = await batchView({ ...f, controls: restarted })
+  assert.deepEqual(view.windowWarning, { ...saved.pendingWindow, retained: 500_000, reason: 'over-budget' })
+  assert.equal(view.pendingWindow, undefined)
+  inputTokens = 450_000
+  restarted.prepareMainRequest(at)
+  const ordinaryRetry = restarted.resolve(sol.provider, sol.model, agent.id, signal, 'prepare')
+  const [blocked] = await collect(restarted.guardStream(main, sent))
+  if (!blocked || typeof blocked === 'string') assert.fail('over-budget retry reached upstream')
+  assert.equal(blocked.reason.failure.code, 'MAGPIE_SESSION_WINDOW_BUDGET_FAILED')
+  assert.equal(ordinaryRetry.canDispatch?.(), false)
+  assert.deepEqual(f.warnings, [])
+})
 
 test('batch validates every field before a write, records raw effort and rejects stale revisions', async (t) => {
   const path = statePath(t)
