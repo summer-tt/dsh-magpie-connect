@@ -31,7 +31,11 @@ sessionContextWindowEnabled: true
 
 两个开关默认都为 `true`。关闭速度控制后，普通请求沿用网关默认策略。开启时，Standard 省略 `service_tier`，Fast 请求 `priority`，Ultrafast 请求 `ultrafast`。关闭上下文控制后，DSH 恢复使用网关模型目录的窗口和相应的默认输出上限。滑杆上的 872K 是 DSH 的本地预算，上游实际接受的长度取决于路由。两项设置均不改变请求模型 ID。
 
-配合新版 T3 Model Picker，收起菜单时一并提交修改过的推理等级、速度和窗口。Host 在写入前检查路由、档位和配置版本。关闭任一项后，T3 同时隐藏对应的滑杆和输入框状态。
+配合 T3 Model Picker `1.1.3-session-controls.3`，收起菜单时一并提交修改过的推理等级、速度和窗口，按 Escape 放弃本次编辑。支持运行中编辑的会话会在后续模型请求采用新设置，已发出的请求及其普通重试沿用原 step 的设置。关闭速度或窗口功能后，T3 会隐藏相应的滑杆和输入框状态。旧版 T3 仍在会话空闲时保存设置。
+
+运行中缩小窗口时，当前窗口保持生效，直到 Host 确认下一次模型请求的输入和输出预算适合新窗口。DSH 可以先尝试自动压缩。如果无法确认预算或新窗口装不下请求，T3 显示 DSH 通知，Host 保留原窗口并应用同批提交的速度和推理等级。若原窗口也装不下请求，Host 会在发送前终止该请求。通过检查的新窗口只更新当前会话，新会话仍沿用最近一次直接保存的窗口。
+
+Host 的 `/api/magpie-session-controls` 仅供 owner 使用。支持运行中编辑时，GET 和保存回执提供 `runningEdits: true`，提交批次时需传 `allowRunning: true` 和最新的 `expectedRevision`。`contextWindow.value` 始终表示已生效的窗口。`pendingWindow` 提供候选的 `id` 和 `target`，`windowWarning` 提供被拒候选的 `id`、`target`、`retained` 和 `reason`。警告原因包括 `unavailable`、`measurement-failed` 和 `over-budget`。
 
 `sessionControlRoutes` 可替换内置路由清单。每项按完整 `provider` 和 `model` 匹配。自定义路由示例：
 

@@ -16,6 +16,7 @@ import {
   type HarnessGenerateOptions,
 } from './messages.ts'
 import { withStallTimeout } from './watchdog.ts'
+import { WINDOW_BUDGET_FAILED } from '../session-controls.ts'
 
 /**
  * Magpie gateway adapter: registers as a DSH LlmAdapter and streams
@@ -73,6 +74,7 @@ export interface CatalogLike {
 interface SessionControls {
   speed?: 'standard' | 'fast' | 'ultrafast'
   contextWindow?: number
+  canDispatch?: () => boolean
 }
 
 export interface MagpieAdapterOptions {
@@ -100,7 +102,8 @@ export interface MagpieAdapterOptions {
   /** The Host initiator supplies session identity during model resolution and call preparation. */
   resolveInitiatorSessionId?: () => string | undefined
   /** Missing controls preserve the catalog limits or the gateway's speed default. */
-  resolveSessionControls?: (provider: string, model: string, sessionId?: string) => SessionControls
+  resolveSessionControls?: (provider: string, model: string, sessionId: string | undefined, signal: AbortSignal | undefined,
+    phase: 'model' | 'prepare' | 'stream') => SessionControls
   /** Optional reasoning-effort filter for this exact route. */
   resolveAllowedEfforts?: (provider: string, model: string) => readonly string[] | undefined
   /** An existing explicit selection may stay valid for its initiating Agent. */
@@ -112,6 +115,7 @@ interface CallSnapshot {
   readonly contextWindow: number
   readonly maxTokens: number
   readonly speed: SessionControls['speed']
+  readonly canDispatch?: () => boolean
 }
 
 const DEFAULT_CONTEXT_WINDOW = 262144
@@ -353,18 +357,20 @@ export class MagpieAdapter {
     return models
   }
 
-  #captureCall(provider: string, model: string, sessionId: string | undefined): CallSnapshot {
-    const controls = this.#resolveSessionControls?.(provider, model, sessionId)
+  #captureCall(provider: string, model: string, sessionId: string | undefined, signal: AbortSignal | undefined,
+    phase: 'model' | 'prepare' | 'stream'): CallSnapshot {
+    const controls = this.#resolveSessionControls?.(provider, model, sessionId, signal, phase)
     return {
       sessionId,
       speed: controls?.speed,
+      canDispatch: controls?.canDispatch,
       contextWindow: controls?.contextWindow ?? this.#catalog.contextWindowFor?.(model) ?? DEFAULT_CONTEXT_WINDOW,
       maxTokens: this.#catalog.maxTokensFor?.(model) ?? DEFAULT_MAX_TOKENS,
     }
   }
 
-  resolveModel(provider: string, model: string) {
-    const snapshot = this.#captureCall(provider, model, this.#resolveInitiatorSessionId?.())
+  resolveModel(provider: string, model: string, signal?: AbortSignal) {
+    const snapshot = this.#captureCall(provider, model, this.#resolveInitiatorSessionId?.(), signal, 'model')
     return this.#resolveModel(provider, model, snapshot)
   }
 
@@ -422,12 +428,12 @@ export class MagpieAdapter {
   async prepareCall(
     provider: string,
     model: string,
-    _signal?: AbortSignal,
+    signal?: AbortSignal,
   ): Promise<{
     model: ReturnType<MagpieAdapter['resolveModel']>
     stream: (options: HarnessGenerateOptions) => AsyncGenerator<HarnessChunk>
   }> {
-    const snapshot = this.#captureCall(provider, model, this.#resolveInitiatorSessionId?.())
+    const snapshot = this.#captureCall(provider, model, this.#resolveInitiatorSessionId?.(), signal, 'prepare')
     const existingEffort = this.#resolveInitiatorReasoningEffort?.(provider, model)
     return {
       model: this.#resolveModel(provider, model, snapshot, existingEffort),
@@ -436,7 +442,7 @@ export class MagpieAdapter {
         // compaction can run outside its session's initiator scope.
         const sessionId = options.sessionId ?? snapshot.sessionId
         if (sessionId !== snapshot.sessionId || provider !== options.provider || model !== options.model) {
-          return this.#stream(options, this.#captureCall(options.provider, options.model, sessionId))
+          return this.#stream(options, this.#captureCall(options.provider, options.model, sessionId, options.signal, 'stream'))
         }
         return this.#stream(options, snapshot)
       },
@@ -463,7 +469,7 @@ export class MagpieAdapter {
 
   async *stream(options: HarnessGenerateOptions): AsyncGenerator<HarnessChunk> {
     const sessionId = options.sessionId ?? this.#resolveInitiatorSessionId?.()
-    yield* this.#stream(options, this.#captureCall(options.provider, options.model, sessionId))
+    yield* this.#stream(options, this.#captureCall(options.provider, options.model, sessionId, options.signal, 'stream'))
   }
 
   /**
@@ -477,6 +483,12 @@ export class MagpieAdapter {
    * instead of hanging to the SDK/harness timeout.
    */
   async *#stream(options: HarnessGenerateOptions, snapshot: CallSnapshot): AsyncGenerator<HarnessChunk> {
+    if (snapshot.canDispatch?.() === false) {
+      yield { type: 'finish', reason: { kind: 'error', failure: {
+        code: WINDOW_BUDGET_FAILED, message: 'Magpie context window admission was interrupted',
+      } } }
+      return
+    }
     const baseUrl = this.#requireBaseUrl()
     const endpoints = this.#catalog.getEntry?.(options.model)?.nativeEndpoints ?? []
     const hasImage = contentHasImage(options.messages)
