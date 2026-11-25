@@ -6,6 +6,7 @@ import {
   ModelCatalog,
   modelApiForEntry,
   thinkingLevelMapFor,
+  type EndpointApi,
 } from './catalog.ts'
 import { toStreamChunks, type HarnessChunk, type PiEvent } from './events.ts'
 import {
@@ -61,7 +62,13 @@ export interface MagpieModelInfo {
 export interface CatalogLike {
   list(): string[]
   decision(model: string): { allowed: boolean; source: string; known: boolean }
-  getEntry?(model: string): { nativeEndpoints: string[]; displayName?: string } | undefined
+  getEntry?(model: string): { nativeEndpoints: string[]; prefers?: string; displayName?: string } | undefined
+  /**
+   * The wire every request for one model rides, as the catalog decides it
+   * from `native_endpoints` and `magpie_prefers`. Optional: without it the
+   * adapter applies {@link modelApiForEntry} to the entry itself.
+   */
+  apiFor?(model: string): EndpointApi
   reasoningFor?(model: string): { efforts: Array<{ id: string; name: string; description?: string }>; defaultEffort: string } | undefined
   thinks?(model: string): boolean
   supportsImage?(model: string): boolean
@@ -69,6 +76,19 @@ export interface CatalogLike {
   requiresResponsesApi?(model: string): boolean
   contextWindowFor?(model: string): number
   maxTokensFor?(model: string): number
+}
+
+/**
+ * The one wire value for a whole turn: the outbound pi-ai model and the
+ * replayed assistant history both take it, so they are serialised for one
+ * and the same wire. Taken from the catalog when it decides it, else from
+ * the entry with the same rule — never from the model id of a listed model.
+ */
+function apiFor(catalog: CatalogLike, id: string): EndpointApi {
+  const own = catalog.apiFor?.(id)
+  if (own !== undefined) return own
+  const entry = catalog.getEntry?.(id)
+  return modelApiForEntry(entry?.nativeEndpoints ?? [], entry?.prefers)
 }
 
 interface SessionControls {
@@ -208,11 +228,10 @@ function toPiModel(
   providerId: string,
   baseUrl: string,
   id: string,
+  api: EndpointApi,
   catalog: CatalogLike,
   { contextWindow, maxTokens }: Pick<CallSnapshot, 'contextWindow' | 'maxTokens'>,
 ): Model<Api> {
-  const endpoints = catalog.getEntry?.(id)?.nativeEndpoints ?? []
-  const api = modelApiForEntry(endpoints)
   const entryThinks = catalog.thinks?.(id) ?? api === 'openai-responses'
   const ladder = catalog.reasoningFor?.(id)
   const ladderIds = ladder?.efforts.map((effort) => effort.id)
@@ -490,15 +509,19 @@ export class MagpieAdapter {
       return
     }
     const baseUrl = this.#requireBaseUrl()
-    const endpoints = this.#catalog.getEntry?.(options.model)?.nativeEndpoints ?? []
+    // One decision for the whole turn: the outbound wire and the replayed
+    // assistant history are tagged with the same api, so pi-ai serialises the
+    // history the way the wire expects (a history on another api is a
+    // "foreign" turn whose reasoning is rewritten as plain text).
+    const api = apiFor(this.#catalog, options.model)
     const hasImage = contentHasImage(options.messages)
     if (hasImage && !(this.#catalog.supportsImage?.(options.model) ?? false)) {
       throw new Error(`dsh-magpie-connect: model "${options.model}" does not accept image input`)
     }
     const context = hasImage
-      ? await this.#imageContext(options, endpoints)
-      : toPiContext(options, endpoints)
-    const model = toPiModel(this.#providerId, baseUrl, options.model, this.#catalog, snapshot)
+      ? await this.#imageContext(options, api)
+      : toPiContext(options, api)
+    const model = toPiModel(this.#providerId, baseUrl, options.model, api, this.#catalog, snapshot)
     // Linked controller: the watchdog aborts the upstream on stall, while a
     // harness abort (user stop / host timeout) still propagates through.
     const controller = new AbortController()
@@ -520,12 +543,12 @@ export class MagpieAdapter {
     }
   }
 
-  async #imageContext(options: HarnessGenerateOptions, endpoints: readonly string[]): Promise<ReturnType<typeof toPiContext>> {
+  async #imageContext(options: HarnessGenerateOptions, api: EndpointApi): Promise<ReturnType<typeof toPiContext>> {
     const attachments = this.#resolveAttachments?.()
     if (!attachments) {
       throw new Error('dsh-magpie-connect: image input requires the attachment service')
     }
-    return toPiContextWithImages(options, attachments, endpoints)
+    return toPiContextWithImages(options, attachments, api)
   }
 
   #eventsFor(

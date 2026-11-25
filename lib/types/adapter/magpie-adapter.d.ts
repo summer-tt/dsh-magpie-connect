@@ -1,4 +1,4 @@
-import { ModelCatalog } from './catalog.ts';
+import { ModelCatalog, type EndpointApi } from './catalog.ts';
 import { type HarnessChunk, type PiEvent } from './events.ts';
 import { type AttachmentStore, type HarnessGenerateOptions } from './messages.ts';
 /**
@@ -44,8 +44,15 @@ export interface CatalogLike {
     };
     getEntry?(model: string): {
         nativeEndpoints: string[];
+        prefers?: string;
         displayName?: string;
     } | undefined;
+    /**
+     * The wire every request for one model rides, as the catalog decides it
+     * from `native_endpoints` and `magpie_prefers`. Optional: without it the
+     * adapter applies {@link modelApiForEntry} to the entry itself.
+     */
+    apiFor?(model: string): EndpointApi;
     reasoningFor?(model: string): {
         efforts: Array<{
             id: string;

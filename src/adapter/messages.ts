@@ -5,9 +5,13 @@
  * durable image blocks resolve bytes through the harness attachment service
  * (`toPiContextWithImages`, async). pi-ai then encodes images as OpenAI
  * `image_url` (completions) or `input_image` (responses) parts.
+ *
+ * Both take the wire the turn rides (`api`) — the same value the outbound
+ * model carries — and tag the replayed assistant history with it, so the
+ * history and the request are serialised for one and the same wire.
  */
 
-import { modelApiForEntry } from './catalog.ts'
+import type { EndpointApi } from './catalog.ts'
 
 export interface ImageAttachmentRef {
   attachmentId: string
@@ -71,7 +75,7 @@ export type PiMessage =
   | {
       role: 'assistant'
       content: PiAssistantBlock[]
-      api: 'openai-completions' | 'openai-responses'
+      api: EndpointApi
       provider: string
       model: string
       usage: PiUsage
@@ -262,7 +266,7 @@ export function userContentWithImages(
 function toPiAssistant(
   message: HarnessMessage,
   providerId: string,
-  api: 'openai-completions' | 'openai-responses' = 'openai-completions',
+  api: EndpointApi,
 ): Extract<PiMessage, { role: 'assistant' }> {
   const content: PiAssistantBlock[] = []
   for (const block of message.content) {
@@ -315,19 +319,14 @@ function toolsOf(options: HarnessGenerateOptions): PiTool[] | undefined {
   return tools && tools.length > 0 ? tools : undefined
 }
 
-function assistantApiFor(options: HarnessGenerateOptions, entryEndpoints: readonly string[]): 'openai-completions' | 'openai-responses' {
-  void options
-  return modelApiForEntry(entryEndpoints)
-}
-
 /**
  * Text-only conversion (no image bytes needed). Images without resolved
  * bytes cannot be sent — callers must route image-bearing requests through
  * `toPiContextWithImages` instead.
+ * @param api - the wire this turn rides; the assistant history is tagged with it.
  */
-export function toPiContext(options: HarnessGenerateOptions, entryEndpoints: readonly string[] = []): PiContext {
+export function toPiContext(options: HarnessGenerateOptions, api: EndpointApi = 'openai-completions'): PiContext {
   const providerId = options.provider
-  const assistantApi = assistantApiFor(options, entryEndpoints)
   const toolNames = new Map<string, string>()
   const messages: PiMessage[] = []
   for (const message of options.messages) {
@@ -337,7 +336,7 @@ export function toPiContext(options: HarnessGenerateOptions, entryEndpoints: rea
       continue
     }
     if (message.role === 'assistant') {
-      const assistant = toPiAssistant(message, providerId, assistantApi)
+      const assistant = toPiAssistant(message, providerId, api)
       for (const block of assistant.content) {
         if (block.type === 'toolCall') toolNames.set(block.id, block.name)
       }
@@ -400,14 +399,14 @@ export function toPiContext(options: HarnessGenerateOptions, entryEndpoints: rea
 /**
  * Image-aware conversion: retained images resolve to request bytes via the
  * attachment service; offloaded images become placeholder text.
+ * @param api - the wire this turn rides; the assistant history is tagged with it.
  */
 export async function toPiContextWithImages(
   options: HarnessGenerateOptions,
   attachments: AttachmentStore,
-  entryEndpoints: readonly string[] = [],
+  api: EndpointApi = 'openai-completions',
 ): Promise<PiContext> {
   const providerId = options.provider
-  const assistantApi = assistantApiFor(options, entryEndpoints)
   const requestImages = await prepareRequestImages(options.messages, attachments, options.signal)
   const toolNames = new Map<string, string>()
   const messages: PiMessage[] = []
@@ -418,7 +417,7 @@ export async function toPiContextWithImages(
       continue
     }
     if (message.role === 'assistant') {
-      const assistant = toPiAssistant(message, providerId, assistantApi)
+      const assistant = toPiAssistant(message, providerId, api)
       for (const block of assistant.content) {
         if (block.type === 'toolCall') toolNames.set(block.id, block.name)
       }

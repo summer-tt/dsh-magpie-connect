@@ -29,11 +29,20 @@ export interface MagpieModelEntry {
   image: boolean
   /** Raw gateway `native_endpoints` (may be empty when undisclosed). */
   nativeEndpoints: string[]
+  /**
+   * Raw gateway `magpie_prefers`: the path the gateway says it is best asked
+   * on for this model (`/v1/responses`, `/v1/chat/completions`). Absent when
+   * the gateway said nothing or said something the plugin cannot read.
+   */
+  prefers?: string
   /** Whether the gateway reports thinking support. */
   reasoning: boolean
   /** Effort allowlist from `supported_reasoning_levels` (canonical order). */
   efforts?: string[]
 }
+
+/** The two wires the plugin speaks; anything else the gateway has to translate. */
+export type EndpointApi = 'openai-completions' | 'openai-responses'
 
 /**
  * Thinking levels the gateway uses. pi-ai natively understands the minimal→max
@@ -112,22 +121,80 @@ export function thinkingLevelMapFor(efforts: readonly string[] | undefined): Rec
 }
 
 /**
- * True when the model must go through `/v1/responses` instead of chat
- * completions: the gateway lists responses as the only native endpoint
- * (Muse Spark, Codex/Grok lanes). Anything advertising
- * `/v1/chat/completions` — including multi-endpoint models — rides the
- * completions lane for better tool support.
+ * The wire one gateway path names, if it is one of the two the plugin speaks.
+ *
+ * Matched by whole path segment (`/v1/chat/completions`, `/v1/responses`,
+ * possibly behind a prefix), never by substring: `/v1/responses/compact` and
+ * the like are other endpoints and must not read as a supported wire.
  */
-export function requiresResponsesApiEntry(nativeEndpoints: readonly string[]): boolean {
-  const hasCompletions = nativeEndpoints.some((endpoint) => endpoint.includes('/chat/completions'))
-  if (hasCompletions) return false
-  return nativeEndpoints.some((endpoint) => endpoint.includes('/responses'))
+export function apiOfPath(path: string): EndpointApi | undefined {
+  if (!/\/responses$/.test(path)) {
+    return /\/chat\/completions$/.test(path) ? 'openai-completions' : undefined
+  }
+  return 'openai-responses'
 }
 
-/** pi-ai `model.api` value for the given native endpoints. */
-export function modelApiForEntry(nativeEndpoints: readonly string[]): 'openai-completions' | 'openai-responses' {
-  return requiresResponsesApiEntry(nativeEndpoints) ? 'openai-responses' : 'openai-completions'
+/**
+ * True when the model must go through `/v1/responses` instead of chat
+ * completions on `native_endpoints` alone: the gateway lists responses as the
+ * only native endpoint the plugin speaks (Muse Spark, Codex/Grok lanes).
+ * Anything advertising `/v1/chat/completions` — including multi-endpoint
+ * models — rides the completions lane for better tool support.
+ */
+export function requiresResponsesApiEntry(nativeEndpoints: readonly string[]): boolean {
+  return modelApiForEntry(nativeEndpoints) === 'openai-responses'
 }
+
+/**
+ * pi-ai `model.api` for one model: the wire every request for it rides, and
+ * the one its replayed assistant history is tagged with. The model id is
+ * never touched.
+ *
+ * Decided from what the gateway's ordinary `GET /models` says —
+ * `native_endpoints` (the paths it relays as-is) and `magpie_prefers` (where
+ * it is best asked) — with Chat Completions first whenever the two do not
+ * settle it:
+ *
+ * - One supported native endpoint: it is used, whatever the preference says.
+ * - Several: the preference is adopted only when it is *literally one of the
+ *   listed paths* — the gateway named that path as best — and the plugin
+ *   speaks it; otherwise Chat.
+ * - None listed: nothing is known about what the gateway relays, so either
+ *   supported preference may be adopted; missing or illegal → Chat.
+ * - Listed, but nothing the plugin supports (e.g. Anthropic only): the
+ *   gateway translates whatever arrives, exactly as before — a preference
+ *   for a wire it did not list is not adopted, and the turn stays on Chat.
+ *
+ * @param nativeEndpoints - the raw `native_endpoints` list.
+ * @param prefers - the raw `magpie_prefers` path, when the gateway gave one.
+ * @returns the wire to send this model's requests on.
+ */
+export function modelApiForEntry(nativeEndpoints: readonly string[], prefers?: string): EndpointApi {
+  const supported = new Set<EndpointApi>()
+  for (const endpoint of nativeEndpoints) {
+    const api = apiOfPath(endpoint)
+    if (api !== undefined) supported.add(api)
+  }
+  if (supported.size === 1) return [...supported][0]!
+  if (supported.size === 0) {
+    // An undisclosed list leaves the preference as the only thing to go on;
+    // a list that names nothing the plugin speaks is left alone (Chat), so
+    // the gateway's translation keeps receiving what it always did.
+    return nativeEndpoints.length === 0 ? (prefers === undefined ? undefined : apiOfPath(prefers)) ?? 'openai-completions' : 'openai-completions'
+  }
+  // Several supported wires: the preference has to be the gateway's own
+  // listed path, not merely a path that names a listed wire (a `/v2/responses`
+  // the gateway did not list is not what it said it prefers).
+  const preferred = prefers !== undefined && nativeEndpoints.includes(prefers) ? apiOfPath(prefers) : undefined
+  return preferred !== undefined && supported.has(preferred) ? preferred : 'openai-completions'
+}
+
+/**
+ * The compat heuristic for an id the directory does not list at all: the
+ * Codex/Grok/Muse lanes read as Responses, everything else as Chat. Only a
+ * capability hint (`requiresResponsesApi`); never what a request is sent on.
+ */
+const LEGACY_RESPONSES_ID = /muse-spark|codex\/|grok/i
 
 /** The gateway separates a model name from its group with a middle dot. */
 const LABEL_GROUP_SEPARATOR = '\u00B7'
@@ -182,12 +249,29 @@ export function decodeModel(raw: unknown): MagpieModelEntry | undefined {
   const nativeEndpoints = Array.isArray(record.native_endpoints)
     ? (record.native_endpoints as unknown[]).filter((e): e is string => typeof e === 'string')
     : []
+  // `magpie_prefers` is the gateway's own path spelling. Only a path the
+  // plugin can read as one of its two wires is kept; anything else (a bare
+  // protocol name, a number, an empty string) is dropped rather than stored
+  // and guessed at later — the wire then stays on the native-endpoint rule.
+  const rawPrefers = record.magpie_prefers
+  const prefersPath = typeof rawPrefers === 'string' ? rawPrefers.trim() : ''
+  const prefers = prefersPath !== '' && apiOfPath(prefersPath) !== undefined ? prefersPath : undefined
   const reasoning = record.reasoning === true
   const levels = record.supported_reasoning_levels
   const efforts = Array.isArray(levels)
     ? canonicalEfforts(levels.map((entry) => (entry as { effort?: unknown })?.effort ?? entry))
     : undefined
-  return { id, displayName, ...(contextWindow !== undefined ? { contextWindow } : {}), ...(maxTokens !== undefined ? { maxTokens } : {}), image, nativeEndpoints, reasoning, ...(efforts !== undefined ? { efforts } : {}) }
+  return {
+    id,
+    displayName,
+    ...(contextWindow !== undefined ? { contextWindow } : {}),
+    ...(maxTokens !== undefined ? { maxTokens } : {}),
+    image,
+    nativeEndpoints,
+    ...(prefers !== undefined ? { prefers } : {}),
+    reasoning,
+    ...(efforts !== undefined ? { efforts } : {}),
+  }
 }
 
 /** Decode the full gateway `/v1/models` payload into entries keyed by id. */
@@ -399,6 +483,9 @@ export class ModelCatalog {
         (entry?.efforts ?? []).join(','),
         String(entry?.contextWindow ?? 0),
         String(entry?.maxTokens ?? 0),
+        // The wire is part of what the picker's row shows (`responsesOnly`),
+        // so a preference that moved it is a changed exposed set.
+        this.apiFor(id),
       ].join('|')
     })
     return rows.join('\n')
@@ -615,10 +702,35 @@ export class ModelCatalog {
     return entry.efforts.includes(effort)
   }
 
+  /**
+   * The wire every request for one model rides, decided by
+   * {@link modelApiForEntry} from the gateway directory's `native_endpoints`
+   * and `magpie_prefers`. The outbound model and the replayed assistant
+   * history both take this one value, and the route id is never touched.
+   *
+   * Read from the live or cached directory only (`getEntry`), exactly as
+   * requests always did: an id only the built-in snapshot knows, or one the
+   * catalog has not loaded yet, goes to Chat. The snapshot predates the
+   * preference and may be stale, so it is not a source for what is sent.
+   * @param model - the route id.
+   * @returns the wire to send this model's requests on.
+   */
+  apiFor(model: string): EndpointApi {
+    const entry = this.getEntry(model)
+    return entry ? modelApiForEntry(entry.nativeEndpoints, entry.prefers) : 'openai-completions'
+  }
+
+  /**
+   * Capability hint (the picker's image default): whether the model relays on
+   * Responses. Reads the directory *and* the built-in snapshot, and keeps its
+   * pre-existing `muse-spark`/`codex/`/`grok` heuristic for an id neither
+   * lists — neither of which decides what a request is sent on; see
+   * {@link apiFor}.
+   */
   requiresResponsesApi(model: string): boolean {
     const entry = this.#entryFor(model)
-    if (!entry) return /muse-spark|codex\/|grok/i.test(model)
-    return requiresResponsesApiEntry(entry.nativeEndpoints)
+    if (!entry) return LEGACY_RESPONSES_ID.test(model)
+    return modelApiForEntry(entry.nativeEndpoints, entry.prefers) === 'openai-responses'
   }
 
   contextWindowFor(model: string): number {
@@ -709,14 +821,23 @@ export async function fetchMagpieModels(
   return models
 }
 
-/** Cache schema v3: labels now use display_name plus parsed/id-derived group. */
-const MODELS_CACHE_VERSION = 3
+/**
+ * Cache schema v4: entries carry `prefers` (the gateway's `magpie_prefers`).
+ *
+ * A v3 file predates the preference. Its entries are complete otherwise, so
+ * they are restored as-is — such a model simply stays on the Chat-first rule
+ * until the next successful refresh brings its preference.
+ */
+const MODELS_CACHE_VERSION = 4
 
 interface ModelsCache {
   version: number
   updatedAt: number
   entries: MagpieModelEntry[]
 }
+
+/** Cache versions whose entries are complete for the current reader. */
+const READABLE_CACHE_VERSIONS = new Set([MODELS_CACHE_VERSION, 3])
 
 async function saveModelsCache(path: string, entries: Map<string, MagpieModelEntry>, now: number): Promise<void> {
   const cache: ModelsCache = { version: MODELS_CACHE_VERSION, updatedAt: now, entries: [...entries.values()] }
@@ -738,15 +859,14 @@ async function loadModelsCache(path: string): Promise<Map<string, MagpieModelEnt
   if (Date.now() - raw.updatedAt > 7 * 24 * 60 * 60 * 1000) {
     throw new Error('gateway cache too old')
   }
-  const legacy = raw.version !== MODELS_CACHE_VERSION
-  return new Map(raw.entries.map((entry) => {
-    // A legacy cache has no raw gateway fields to recompute the new label
-    // from. Preserve ids and capabilities, and use id as the label until a
-    // successful refresh replaces them. This avoids falling back to the stale
-    // compile-time snapshot offline.
-    const relabeled = legacy ? { ...entry, displayName: entry.id } : entry
-    return [entry.id, relabeled]
-  }))
+  if (READABLE_CACHE_VERSIONS.has(raw.version)) {
+    return new Map(raw.entries.map((entry) => [entry.id, entry]))
+  }
+  // An older cache has no raw gateway fields to recompute the new label
+  // from. Preserve ids and capabilities, and use id as the label until a
+  // successful refresh replaces them. This avoids falling back to the stale
+  // compile-time snapshot offline.
+  return new Map(raw.entries.map((entry) => [entry.id, { ...entry, displayName: entry.id }]))
 }
 
 /** Default cache location next to the plugin data dir (index.ts convention). */

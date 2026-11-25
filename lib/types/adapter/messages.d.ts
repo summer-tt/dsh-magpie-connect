@@ -5,7 +5,12 @@
  * durable image blocks resolve bytes through the harness attachment service
  * (`toPiContextWithImages`, async). pi-ai then encodes images as OpenAI
  * `image_url` (completions) or `input_image` (responses) parts.
+ *
+ * Both take the wire the turn rides (`api`) — the same value the outbound
+ * model carries — and tag the replayed assistant history with it, so the
+ * history and the request are serialised for one and the same wire.
  */
+import type { EndpointApi } from './catalog.ts';
 export interface ImageAttachmentRef {
     attachmentId: string;
     mediaType: string;
@@ -92,7 +97,7 @@ export type PiMessage = {
 } | {
     role: 'assistant';
     content: PiAssistantBlock[];
-    api: 'openai-completions' | 'openai-responses';
+    api: EndpointApi;
     provider: string;
     model: string;
     usage: PiUsage;
@@ -191,10 +196,12 @@ export declare function userContentWithImages(blocks: HarnessBlock[], requestIma
  * Text-only conversion (no image bytes needed). Images without resolved
  * bytes cannot be sent — callers must route image-bearing requests through
  * `toPiContextWithImages` instead.
+ * @param api - the wire this turn rides; the assistant history is tagged with it.
  */
-export declare function toPiContext(options: HarnessGenerateOptions, entryEndpoints?: readonly string[]): PiContext;
+export declare function toPiContext(options: HarnessGenerateOptions, api?: EndpointApi): PiContext;
 /**
  * Image-aware conversion: retained images resolve to request bytes via the
  * attachment service; offloaded images become placeholder text.
+ * @param api - the wire this turn rides; the assistant history is tagged with it.
  */
-export declare function toPiContextWithImages(options: HarnessGenerateOptions, attachments: AttachmentStore, entryEndpoints?: readonly string[]): Promise<PiContext>;
+export declare function toPiContextWithImages(options: HarnessGenerateOptions, attachments: AttachmentStore, api?: EndpointApi): Promise<PiContext>;

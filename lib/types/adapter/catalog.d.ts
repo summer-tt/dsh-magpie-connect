@@ -24,11 +24,19 @@ export interface MagpieModelEntry {
     image: boolean;
     /** Raw gateway `native_endpoints` (may be empty when undisclosed). */
     nativeEndpoints: string[];
+    /**
+     * Raw gateway `magpie_prefers`: the path the gateway says it is best asked
+     * on for this model (`/v1/responses`, `/v1/chat/completions`). Absent when
+     * the gateway said nothing or said something the plugin cannot read.
+     */
+    prefers?: string;
     /** Whether the gateway reports thinking support. */
     reasoning: boolean;
     /** Effort allowlist from `supported_reasoning_levels` (canonical order). */
     efforts?: string[];
 }
+/** The two wires the plugin speaks; anything else the gateway has to translate. */
+export type EndpointApi = 'openai-completions' | 'openai-responses';
 /**
  * Thinking levels the gateway uses. pi-ai natively understands the minimal→max
  * ladder; `none` (thinking disabled) and `ultra` (beyond max, e.g. Terra) are
@@ -61,15 +69,46 @@ export declare function effortsFor(efforts: readonly string[] | undefined): Reas
  */
 export declare function thinkingLevelMapFor(efforts: readonly string[] | undefined): Record<string, string | null>;
 /**
+ * The wire one gateway path names, if it is one of the two the plugin speaks.
+ *
+ * Matched by whole path segment (`/v1/chat/completions`, `/v1/responses`,
+ * possibly behind a prefix), never by substring: `/v1/responses/compact` and
+ * the like are other endpoints and must not read as a supported wire.
+ */
+export declare function apiOfPath(path: string): EndpointApi | undefined;
+/**
  * True when the model must go through `/v1/responses` instead of chat
- * completions: the gateway lists responses as the only native endpoint
- * (Muse Spark, Codex/Grok lanes). Anything advertising
- * `/v1/chat/completions` — including multi-endpoint models — rides the
- * completions lane for better tool support.
+ * completions on `native_endpoints` alone: the gateway lists responses as the
+ * only native endpoint the plugin speaks (Muse Spark, Codex/Grok lanes).
+ * Anything advertising `/v1/chat/completions` — including multi-endpoint
+ * models — rides the completions lane for better tool support.
  */
 export declare function requiresResponsesApiEntry(nativeEndpoints: readonly string[]): boolean;
-/** pi-ai `model.api` value for the given native endpoints. */
-export declare function modelApiForEntry(nativeEndpoints: readonly string[]): 'openai-completions' | 'openai-responses';
+/**
+ * pi-ai `model.api` for one model: the wire every request for it rides, and
+ * the one its replayed assistant history is tagged with. The model id is
+ * never touched.
+ *
+ * Decided from what the gateway's ordinary `GET /models` says —
+ * `native_endpoints` (the paths it relays as-is) and `magpie_prefers` (where
+ * it is best asked) — with Chat Completions first whenever the two do not
+ * settle it:
+ *
+ * - One supported native endpoint: it is used, whatever the preference says.
+ * - Several: the preference is adopted only when it is *literally one of the
+ *   listed paths* — the gateway named that path as best — and the plugin
+ *   speaks it; otherwise Chat.
+ * - None listed: nothing is known about what the gateway relays, so either
+ *   supported preference may be adopted; missing or illegal → Chat.
+ * - Listed, but nothing the plugin supports (e.g. Anthropic only): the
+ *   gateway translates whatever arrives, exactly as before — a preference
+ *   for a wire it did not list is not adopted, and the turn stays on Chat.
+ *
+ * @param nativeEndpoints - the raw `native_endpoints` list.
+ * @param prefers - the raw `magpie_prefers` path, when the gateway gave one.
+ * @returns the wire to send this model's requests on.
+ */
+export declare function modelApiForEntry(nativeEndpoints: readonly string[], prefers?: string): EndpointApi;
 /**
  * The one label both the DSH model picker and this plugin's settings page show.
  * The model name is exactly `display_name`. Prefer the group after the last
@@ -206,6 +245,27 @@ export declare class ModelCatalog {
     supportsImage(model: string): boolean;
     /** Whether one effort id is selectable for the model. */
     supportsEffort(model: string, effort: string): boolean;
+    /**
+     * The wire every request for one model rides, decided by
+     * {@link modelApiForEntry} from the gateway directory's `native_endpoints`
+     * and `magpie_prefers`. The outbound model and the replayed assistant
+     * history both take this one value, and the route id is never touched.
+     *
+     * Read from the live or cached directory only (`getEntry`), exactly as
+     * requests always did: an id only the built-in snapshot knows, or one the
+     * catalog has not loaded yet, goes to Chat. The snapshot predates the
+     * preference and may be stale, so it is not a source for what is sent.
+     * @param model - the route id.
+     * @returns the wire to send this model's requests on.
+     */
+    apiFor(model: string): EndpointApi;
+    /**
+     * Capability hint (the picker's image default): whether the model relays on
+     * Responses. Reads the directory *and* the built-in snapshot, and keeps its
+     * pre-existing `muse-spark`/`codex/`/`grok` heuristic for an id neither
+     * lists — neither of which decides what a request is sent on; see
+     * {@link apiFor}.
+     */
     requiresResponsesApi(model: string): boolean;
     contextWindowFor(model: string): number;
     maxTokensFor(model: string): number;

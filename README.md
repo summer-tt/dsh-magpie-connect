@@ -268,15 +268,23 @@ DSH 会话
    ▼
 MagpieAdapter（注册为 DSH 的 LlmAdapter）
    │  pi-ai openai-completions 流（默认）/
-   │      openai-responses 流（仅支持 responses 的模型）
+   │      openai-responses 流（目录选定走 responses 的模型）
    ▼
-http://127.0.0.1:3425/v1  ← 按 native_endpoints 选择 chat/completions 或 responses
+http://127.0.0.1:3425/v1  ← 按目录的 native_endpoints 与 magpie_prefers 选 chat/completions 或 responses
 ```
 
 - **模型目录** — 全量接入网关 `GET {baseUrl}/models`，不做付费过滤；磁盘缓存加编译期
   静态快照兜底，网关宕机时选择器仍可用。暴露集合一旦变化（隐藏/显示、换网关地址、
-  刷新后模型增删），会发出 `llm/adapters-updated` 让浏览器重读缓存——否则选择器会
+  刷新后模型增删、某个模型换了协议），会发出 `llm/adapters-updated` 让浏览器重读缓存——否则选择器会
   一直显示旧列表直到下次重启。
+- **请求协议** — 插件只会说 Chat Completions 和 Responses 两种协议，按目录为每个模型
+  选定一种，模型 ID 保持原样、tier 不受影响。网关只公布一种插件支持的 `native_endpoints`
+  时直接用它；公布多种时，采用 `magpie_prefers` 指定的那一种，前提是它既是插件支持的、
+  也在 `native_endpoints` 之中，否则保持 Chat Completions 优先。`native_endpoints` 为空
+  或缺失时，`magpie_prefers` 可以是任一插件支持的协议，缺失或无法识别则回落 Chat
+  Completions。若 `native_endpoints` 非空但没有插件支持的协议（例如只有 Anthropic
+  Messages），不采用列表之外的偏好，沿用原有的兼容翻译。读取目录时不发送
+  `X-Magpie-Drawers`。同一个请求的出站协议与 assistant 历史消息的协议标记一致。
 - **思考档位** — 有档位阶梯的模型进入选择器；没有阶梯但可思考的模型保持可思考
   （显式档位直通网关）；`none` 关闭思考，`ultra` 直通网关，不在本地截断。
 - **图片** — 带图的请求经 harness 附件服务取字节后上行；文本模型收到图片会直接

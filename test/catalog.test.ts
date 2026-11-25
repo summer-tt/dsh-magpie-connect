@@ -326,7 +326,7 @@ test('a legacy on-disk cache keeps its ids but shows bare-id labels', async () =
     await live.refreshOnce()
     assert.equal(live.getEntry('codex/gpt-6-luna')?.displayName, 'Codex/GPT-6-Luna')
     const saved = JSON.parse(readFileSync(cachePath, 'utf8')) as { version: number; entries: Array<{ displayName: string }> }
-    assert.equal(saved.version, 3)
+    assert.equal(saved.version, 4)
     assert.equal(saved.entries[0]?.displayName, 'Codex/GPT-6-Luna')
     live.stop()
   } finally {
