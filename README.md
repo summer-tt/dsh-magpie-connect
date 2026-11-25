@@ -20,7 +20,9 @@
 
 ## T3 会话速度与上下文窗口
 
-配合支持会话滑杆的 T3 Model Picker，在 Magpie 中选 `codex/gpt-6.2-sol` 或 `codex/gpt-6.2-astra`。两个基础模型初始均提供 272K、500K、872K 三个本地窗口。首次使用的默认值是 Fast 与 500K，后续新会话沿用该 provider 和模型最近一次手动选择。现有会话恢复自己的设置。同一 provider 和模型的子 Agent（含 `subagent_fork`）在创建时复制一次父 Agent 的设置，之后可独立运行。选择其他基础模型时使用目标模型自己的偏好。
+配合支持会话滑杆的 T3 Model Picker，可在 Magpie 的 `codex/gpt-6.2-sol`、`codex/gpt-6.2-astra` 和对应的 `group/` 路由上调整速度与上下文窗口。两类路由都提供 272K、500K、872K 三个本地窗口。基础路由首次使用时默认为 Fast 和 500K。带窗口和速度后缀的 Group 路由从其名称所示的档位开始，例如 `group/gpt-6.2-sol-500k-ultrafast` 初始为 Ultrafast 和 500K。只带窗口后缀的 Group 路由初始显示 Standard。
+
+新会话沿用同一 provider 和完整模型 ID 最近一次手动选择，现有会话恢复自己的设置。同一 provider 和模型的子 Agent（含 `subagent_fork`）在创建时复制一次父 Agent 的设置，之后可独立运行。Group 仍由网关按该组的配置路由，实际服务速度也受组成员配置和上游能力影响。
 
 在插件的 Cordis `config` 中可以独立关闭两项功能。例如以下配置仅关闭速度控制：
 

@@ -12,6 +12,10 @@
   调用你在 Magpie 资源库里配好的书签、Notion 等工具，复用上方已保存的网关地址与 Key。
   默认关闭，主动勾选才连接；工具较多时按需提供，不会挤占对话上下文
 
+## v0.8.1-session-controls.4
+
+- Magpie 的 GPT-6.2 Sol 和 Astra Group 模型现在也能在 T3 Model Picker 中调整速度和上下文窗口，包括名称中带窗口和速度档位的模型。
+
 ## v0.8.1-session-controls.3
 
 - 支持在会话运行时调整速度、推理等级和上下文窗口，后续模型请求会采用新设置。

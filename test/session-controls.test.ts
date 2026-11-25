@@ -103,11 +103,12 @@ function selection(f: ReturnType<typeof fixture>, sessionId: string, route: Rout
 
 const defaultChoice = { speed: 'fast', contextWindow: 500_000 }
 
-test('config enables the two exact routes and validates custom options', () => {
+test('config enables the GPT-6.2 routes and validates custom options', () => {
   const cfg = resolveConfig({ providerId: 'magpie' })
   assert.equal(cfg.sessionSpeedEnabled, true)
   assert.equal(cfg.sessionContextWindowEnabled, true)
-  assert.deepEqual(cfg.sessionControlRoutes.map(({ provider, model }) => ({ provider, model })), [sol, astra])
+  assert.ok(cfg.sessionControlRoutes.some(({ provider, model }) => provider === sol.provider && model === sol.model))
+  assert.ok(cfg.sessionControlRoutes.some(({ provider, model }) => provider === astra.provider && model === astra.model))
   assert.deepEqual(resolveConfig({ sessionControlRoutes: [] }).sessionControlRoutes, [])
   const validate = Config['~standard'].validate
   assert.deepEqual(validate({ sessionSpeedEnabled: false, apiKey: 'unchanged' }), { value: { sessionSpeedEnabled: false, apiKey: 'unchanged' } })
@@ -119,6 +120,35 @@ test('config enables the two exact routes and validates custom options', () => {
   assert.match(issue({ sessionControlRoutes: [sol, sol] }), /duplicates/)
   assert.match(issue({ sessionControlRoutes: [{ ...sol, contextWindow: { options: [1.5], default: 1.5 } }] }), /positive integer/)
   assert.match(issue({ sessionControlRoutes: [{ ...sol, speed: { options: ['fast'], default: 'standard' } }] }), /included/)
+})
+
+test('GPT-6.2 Group routes expose and save controls under their exact model IDs', async (t) => {
+  const f = fixture(statePath(t))
+  const variants = [
+    { suffix: '', speed: 'fast', window: 500_000 },
+    { suffix: '-272k', speed: 'standard', window: 272_000 },
+    { suffix: '-500k-ultrafast', speed: 'ultrafast', window: 500_000 },
+    { suffix: '-872k-fast', speed: 'fast', window: 872_000 },
+  ]
+  for (const family of ['sol', 'astra']) {
+    for (const { suffix, speed, window } of variants) {
+      const model = `group/gpt-6.2-${family}${suffix}`
+      const route = { provider: 'magpie', model }
+      add(f, stubAgent(model, route))
+      const response = await send(f, getRequest(model, route))
+      assert.equal(response.status, 200)
+      assert.deepEqual(await response.json(), { ok: true, value: {
+        speed: { options: ['standard', 'fast', 'ultrafast'], value: speed },
+        contextWindow: { options: [272_000, 500_000, 872_000], value: window },
+      } })
+      assert.equal((await send(f, postRequest(model, 'speed', 'ultrafast', route))).status, 200)
+      assert.equal((await send(f, postRequest(model, 'contextWindow', 872_000, route))).status, 200)
+      assert.deepEqual(selection(f, model, route), { speed: 'ultrafast', contextWindow: 872_000 })
+    }
+  }
+  const route = { provider: 'magpie', model: 'group/gpt-6.2-sol-500k-ultrafast' }
+  assert.deepEqual(selection(fixture(statePath(t), { sessionControlRoutes: [] }), route.model, route), {})
+  assert.deepEqual(selection(f, 'unrelated', { provider: 'magpie', model: 'group/gpt-6.2-sol-preview' }), {})
 })
 
 test('GET loads options without updating recency and models/sessions keep separate snapshots', async (t) => {

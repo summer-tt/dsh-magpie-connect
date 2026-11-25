@@ -117,15 +117,29 @@ export interface DshMagpieConnectConfig {
   sessionControlRoutes?: readonly SessionControlRoute[]
 }
 
-const defaultSessionControlRoutes: readonly SessionControlRoute[] = [
-  'codex/gpt-6.2-sol',
-  'codex/gpt-6.2-astra',
-].map((model) => ({
-  provider: 'magpie',
-  model,
-  speed: { options: SESSION_CONTROL_SPEEDS, default: 'fast' },
-  contextWindow: { options: [272_000, 500_000, 872_000], default: 500_000 },
-}))
+const sessionControlWindows = [272_000, 500_000, 872_000] as const
+const groupRouteSpeeds = [
+  { suffix: '', speed: 'standard' },
+  { suffix: '-fast', speed: 'fast' },
+  { suffix: '-ultrafast', speed: 'ultrafast' },
+] as const
+
+function sessionControlRoute(model: string, speed: SessionControlSpeed = 'fast', contextWindow = 500_000): SessionControlRoute {
+  return {
+    provider: 'magpie',
+    model,
+    speed: { options: SESSION_CONTROL_SPEEDS, default: speed },
+    contextWindow: { options: sessionControlWindows, default: contextWindow },
+  }
+}
+
+const defaultSessionControlRoutes: readonly SessionControlRoute[] = ['gpt-6.2-sol', 'gpt-6.2-astra'].flatMap((model) => [
+  sessionControlRoute(`codex/${model}`),
+  sessionControlRoute(`group/${model}`),
+  ...sessionControlWindows.flatMap((window) => groupRouteSpeeds.map(({ suffix, speed }) =>
+    sessionControlRoute(`group/${model}-${window / 1_000}k${suffix}`, speed, window),
+  )),
+])
 
 export function isSessionControlSpeed(value: unknown): value is SessionControlSpeed {
   return SESSION_CONTROL_SPEEDS.some((speed) => speed === value)

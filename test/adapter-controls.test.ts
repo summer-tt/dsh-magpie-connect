@@ -8,6 +8,11 @@ import { decodeMagpieModels, ModelCatalog } from '../src/adapter/catalog.ts'
 import type { HarnessChunk } from '../src/adapter/events.ts'
 import { MagpieAdapter, type MagpieAdapterOptions } from '../src/adapter/magpie-adapter.ts'
 import type { HarnessGenerateOptions } from '../src/adapter/messages.ts'
+import { resolveConfig } from '../src/config.ts'
+import { SessionControls, SessionControlsStore } from '../src/session-controls.ts'
+import { mkdtempSync, rmSync } from 'node:fs'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
 
 const provider = 'magpie'
 const model = 'codex/gpt-6.2-sol'
@@ -82,10 +87,10 @@ async function mockGateway(t: TestContext, { inputTokens = 10, failFirstRequest 
   return { baseUrl: `http://127.0.0.1:${address.port}/v1`, calls }
 }
 
-function makeAdapter(baseUrl: string, transport: Transport, options: MagpieAdapterOptions) {
+function makeAdapter(baseUrl: string, transport: Transport, options: MagpieAdapterOptions, modelId = model) {
   const catalog = new ModelCatalog({ baseUrl })
   catalog.adoptDirectory(decodeMagpieModels({ data: [{
-    id: model,
+    id: modelId,
     native_endpoints: [transport.endpoint],
     context_window: catalogWindow,
     max_output_tokens: gatewayOutputLimit,
@@ -154,6 +159,31 @@ for (const transport of transports) {
     assert.equal(calls.length, cases.length)
   })
 }
+
+test('Group session controls reach Chat Completions with the selected model ID', async (t) => {
+  const groupModel = 'group/gpt-6.2-sol-272k-ultrafast'
+  const sessionId = 'group-session'
+  const directory = mkdtempSync(join(tmpdir(), 'magpie-group-adapter-'))
+  t.after(() => rmSync(directory, { recursive: true, force: true }))
+  const controls = new SessionControls({
+    config: resolveConfig({ providerId: provider }),
+    store: new SessionControlsStore(join(directory, 'controls.json')),
+    agents: () => undefined,
+    catalogEfforts: () => [],
+    warn: (error) => { throw error },
+  })
+  const { baseUrl, calls } = await mockGateway(t)
+  const adapter = makeAdapter(baseUrl, transports[1], {
+    resolveInitiatorSessionId: () => sessionId,
+    resolveSessionControls: controls.resolve.bind(controls),
+  }, groupModel)
+  const prepared = await adapter.prepareCall(provider, groupModel)
+  assert.equal(prepared.model.context.contextWindow, narrowWindow)
+  assert.deepEqual(await finish(prepared.stream(request({ model: groupModel, sessionId }))), { kind: 'stop' })
+  assert.equal(calls[0]?.body.model, groupModel)
+  assert.equal(calls[0]?.body.service_tier, 'ultrafast')
+  assert.equal(calls[0]?.body.max_completion_tokens, narrowDefault)
+})
 
 test('reasoning choices intersect the directory in directory order for the exact route', async (t) => {
   const transport = transports[0]
