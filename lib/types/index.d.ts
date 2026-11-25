@@ -28,7 +28,9 @@ export interface PluginContext {
     get?(key: string): unknown;
     inject?(deps: string[], fn: (ctx: Record<string, unknown>) => unknown): unknown;
     effect?(fn: () => () => void): unknown;
-    on?(event: string, listener: (...args: never[]) => unknown): () => void;
+    on?(event: string, listener: (...args: never[]) => unknown, options?: {
+        prepend?: boolean;
+    }): () => void;
     /**
      * Cordis `ctx.emit` (mixed in from the events service). Used to publish
      * `llm/adapters-updated` when this plugin's own catalog moves, without

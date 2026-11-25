@@ -1,5 +1,7 @@
 import { join } from 'node:path'
 import { writeFile } from 'node:fs/promises'
+import { createRequire } from 'node:module'
+import { pathToFileURL } from 'node:url'
 
 import {
   ModelCatalog,
@@ -16,9 +18,15 @@ import {
   SessionControls,
   acquireSessionControlsStore,
   handleSessionControls,
+  type AgentLoopRequestMarker,
   type SessionControlsAgent,
   type SessionControlsAgents,
   type SessionControlsCreated,
+  type SessionControlsStep,
+  type SessionControlsRequest,
+  type SessionControlsRequestError,
+  type SessionControlsRequestStart,
+  type SessionControlsTokenMeter,
   type SessionModelSelection,
 } from './session-controls.ts'
 import { deriveGatewayBase, fetchTraceView, fetchWebIcon, TRACE_TIMEOUT_MS } from './trace.ts'
@@ -84,7 +92,7 @@ export interface PluginContext {
   get?(key: string): unknown
   inject?(deps: string[], fn: (ctx: Record<string, unknown>) => unknown): unknown
   effect?(fn: () => () => void): unknown
-  on?(event: string, listener: (...args: never[]) => unknown): () => void
+  on?(event: string, listener: (...args: never[]) => unknown, options?: { prepend?: boolean }): () => void
   /**
    * Cordis `ctx.emit` (mixed in from the events service). Used to publish
    * `llm/adapters-updated` when this plugin's own catalog moves, without
@@ -1215,7 +1223,21 @@ export function apply(
 ): { ready: Promise<{ version: string }> } {
   const logger = ctx.logger
   const cfg = resolveConfig(config)
-  const ready = Promise.resolve({ version: 'adapter' })
+  let requestMarker: AgentLoopRequestMarker | undefined
+  const markerReady = (async () => {
+    try {
+      const profile = ctx.get?.('profileContext') as { installAnchor?: string } | undefined
+      if (!profile?.installAnchor) return
+      // The marker is a private WeakSet in this module instance. Resolve from
+      // the Host's anchor so the adapter and the Agent loop agree on identity.
+      const resolved = createRequire(profile.installAnchor).resolve('@deepseek-ai/dsh-llm')
+      const llm = await import(pathToFileURL(resolved).href)
+      if (typeof llm.isAgentLoopRequest === 'function') requestMarker = llm.isAgentLoopRequest
+    } catch (error) {
+      logger.warn('dsh-magpie-connect: Agent request marker unavailable', error)
+    }
+  })()
+  const ready = markerReady.then(() => ({ version: 'adapter' }))
 
   if (!ctx.llm || typeof ctx.llm.registerAdapter !== 'function') {
     logger.error('dsh-magpie-connect: llm service unavailable; adapter cannot register')
@@ -1381,6 +1403,9 @@ export function apply(
     store: controlsStore.store,
     agents,
     catalogEfforts: (model) => catalog.reasoningFor(model)?.efforts.map(({ id }) => id) ?? [],
+    ...(ctx.on && { catalogHasModel: (model: string) => catalog.list().includes(model) }),
+    requestMarker: () => requestMarker,
+    tokenMeter: () => ctx.get?.('tokenMeter') as SessionControlsTokenMeter | undefined,
     ...(listModels && resolveCallConfig && { validateSelection: async (selection, signal) => {
       await resolveCallConfig(selection, signal)
       // Model resolution can succeed for an existing but unlisted route. Match
@@ -1434,7 +1459,7 @@ export function apply(
         return undefined
       }
     },
-    resolveSessionControls: (provider, model, sessionId) => sessionControls.resolve(provider, model, sessionId),
+    resolveSessionControls: (provider, model, sessionId, signal, phase) => sessionControls.resolve(provider, model, sessionId, signal, phase),
     resolveAllowedEfforts: (provider: string, model: string) => sessionControls.allowedEfforts(provider, model),
     resolveInitiatorReasoningEffort: (provider: string, model: string) => {
       try {
@@ -1578,18 +1603,22 @@ export function apply(
       if (currentBackend?.sessionControls === sessionControls) sessionControls.onCreated(created)
     })
   }
-  if (cfg.sessionSpeedEnabled || cfg.sessionContextWindowEnabled || cfg.sessionControlRoutes.some((route) => route.efforts !== undefined)) {
-    ctx.on?.('agent/pre-step', (
-      { agent, modelSelection }: { agent: SessionControlsAgent; modelSelection: SessionModelSelection },
-      next: () => unknown,
-    ) => {
-      sessionControls.observeStep(agent, modelSelection)
-      return next()
-    })
-    ctx.on?.('agent/status', ({ agent, status }: { agent: SessionControlsAgent; status: string }) => {
-      if (status === 'idle') sessionControls.observeIdle(agent)
-    })
-  }
+  ctx.on?.('agent/pre-step', (event: SessionControlsStep, next: () => unknown) => {
+    if (currentBackend?.sessionControls === sessionControls) sessionControls.observeStep(event.agent, event.modelSelection, event)
+    return next()
+  }, { prepend: true })
+  ctx.on?.('agent/request', async (event: SessionControlsRequestStart, next: () => unknown) => {
+    const config = await next()
+    if (currentBackend?.sessionControls === sessionControls) sessionControls.prepareMainRequest(event)
+    return config
+  }, { prepend: true })
+  ctx.on?.('agent/status', ({ agent, status }: { agent: SessionControlsAgent; status: string }) => {
+    if (status === 'idle') sessionControls.observeIdle(agent)
+  })
+  ctx.on?.('llm/stream', (request: SessionControlsRequest, next: () => AsyncIterable<unknown>) =>
+    currentBackend?.sessionControls === sessionControls ? sessionControls.guardStream(request, next) : next())
+  ctx.on?.('agent/request-error', (event: SessionControlsRequestError, next: () => unknown) =>
+    (currentBackend?.sessionControls === sessionControls && sessionControls.retryWindow(event)) || next(), { prepend: true })
   installSettingsRoutes(ctx, logger)
   installSearchProvider(ctx, logger, {
     id: cfg.providerId,
@@ -1626,6 +1655,7 @@ export function apply(
   const maybeEffect = (ctx as { effect?: PluginContext['effect'] }).effect
   if (typeof maybeEffect === 'function') {
     maybeEffect.call(ctx, () => () => {
+      if (currentBackend?.sessionControls === sessionControls) currentBackend = null
       catalog.stop()
       controlsStore.release()
     })

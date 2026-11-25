@@ -64,6 +64,7 @@ export interface CatalogLike {
 interface SessionControls {
     speed?: 'standard' | 'fast' | 'ultrafast';
     contextWindow?: number;
+    canDispatch?: () => boolean;
 }
 export interface MagpieAdapterOptions {
     magpieBaseUrl?: string;
@@ -90,7 +91,7 @@ export interface MagpieAdapterOptions {
     /** The Host initiator supplies session identity during model resolution and call preparation. */
     resolveInitiatorSessionId?: () => string | undefined;
     /** Missing controls preserve the catalog limits or the gateway's speed default. */
-    resolveSessionControls?: (provider: string, model: string, sessionId?: string) => SessionControls;
+    resolveSessionControls?: (provider: string, model: string, sessionId: string | undefined, signal: AbortSignal | undefined, phase: 'model' | 'prepare' | 'stream') => SessionControls;
     /** Optional reasoning-effort filter for this exact route. */
     resolveAllowedEfforts?: (provider: string, model: string) => readonly string[] | undefined;
     /** An existing explicit selection may stay valid for its initiating Agent. */
@@ -145,7 +146,7 @@ export declare class MagpieAdapter {
         name: string;
         inputModalities: string[];
     }>;
-    resolveModel(provider: string, model: string): {
+    resolveModel(provider: string, model: string, signal?: AbortSignal): {
         provider: string;
         id: string;
         name: string;
@@ -163,7 +164,7 @@ export declare class MagpieAdapter {
             defaultEffort?: string;
         };
     };
-    prepareCall(provider: string, model: string, _signal?: AbortSignal): Promise<{
+    prepareCall(provider: string, model: string, signal?: AbortSignal): Promise<{
         model: ReturnType<MagpieAdapter['resolveModel']>;
         stream: (options: HarnessGenerateOptions) => AsyncGenerator<HarnessChunk>;
     }>;
