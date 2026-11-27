@@ -1,4 +1,18 @@
 import type { MagpieSearchMode } from './settings.ts';
+export declare const SESSION_CONTROL_SPEEDS: readonly ["standard", "fast", "ultrafast"];
+export type SessionControlSpeed = (typeof SESSION_CONTROL_SPEEDS)[number];
+export interface SessionControlOptions<T> {
+    readonly options: readonly T[];
+    readonly default: T;
+}
+export interface SessionControlRoute {
+    readonly provider: string;
+    readonly model: string;
+    readonly speed?: SessionControlOptions<SessionControlSpeed>;
+    readonly contextWindow?: SessionControlOptions<number>;
+    /** Optional allowlist applied to this route's catalog reasoning efforts. */
+    readonly efforts?: readonly string[];
+}
 export interface DshMagpieConnectConfig {
     /**
      * Provider route id registered into DSH (the grouping key in the model
@@ -77,7 +91,29 @@ export interface DshMagpieConnectConfig {
      * there, which is how an older Magpie keeps working.
      */
     mcpAgent?: string;
+    /** Enable per-session request speed on supported routes. Defaults to true. */
+    sessionSpeedEnabled?: boolean;
+    /** Enable per-session context budgets on supported routes. Defaults to true. */
+    sessionContextWindowEnabled?: boolean;
+    /** Exact provider/model capabilities. An explicit list replaces the built-in routes. */
+    sessionControlRoutes?: readonly SessionControlRoute[];
 }
+export declare function isSessionControlSpeed(value: unknown): value is SessionControlSpeed;
+export declare function isContextWindow(value: unknown): value is number;
+/** Cordis Standard Schema. Existing settings still use their original normalization. */
+export declare const Config: {
+    '~standard': {
+        version: 1;
+        vendor: string;
+        validate(value: unknown): {
+            value: DshMagpieConnectConfig;
+        } | {
+            issues: {
+                message: string;
+            }[];
+        };
+    };
+};
 export declare const defaults: {
     readonly providerId: "dsh-magpie-connect";
     readonly displayName: "Magpie";
@@ -94,11 +130,16 @@ export declare const defaults: {
     readonly searchTimeoutMs: 120000;
     readonly mcpToolCallTimeoutMs: 120000;
     readonly mcpAgent: "";
+    readonly sessionSpeedEnabled: true;
+    readonly sessionContextWindowEnabled: true;
+    readonly sessionControlRoutes: readonly SessionControlRoute[];
 };
-export type ResolvedConfig = Required<Pick<DshMagpieConnectConfig, 'providerId' | 'refreshSeconds' | 'searchMode' | 'searchModel' | 'searchMaxUses' | 'searchTimeoutMs' | 'mcpToolCallTimeoutMs' | 'mcpAgent'>> & DshMagpieConnectConfig & {
+type RequiredConfig = 'providerId' | 'refreshSeconds' | 'searchMode' | 'searchModel' | 'searchMaxUses' | 'searchTimeoutMs' | 'mcpToolCallTimeoutMs' | 'mcpAgent' | 'sessionSpeedEnabled' | 'sessionContextWindowEnabled' | 'sessionControlRoutes';
+export type ResolvedConfig = Required<Pick<DshMagpieConnectConfig, RequiredConfig>> & DshMagpieConnectConfig & {
     displayName: string;
     baseUrl: string;
     apiKey: string;
     dataDir: string;
 };
 export declare function resolveConfig(config?: DshMagpieConnectConfig): ResolvedConfig;
+export {};
