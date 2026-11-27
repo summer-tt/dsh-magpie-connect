@@ -22,10 +22,29 @@ type WindowWarning = PendingWindow & { reason: WindowWarningReason }
 type WindowState = { pendingWindow?: PendingWindow; windowWarning?: WindowWarning }
 type SessionPreferences = SessionControlsSelection & WindowState
 
-type SessionControlsChoices = {
+export type DraftControls = {
   speed?: Choice<SessionControlSpeed>
   contextWindow?: Choice<number>
   efforts?: string[]
+}
+
+type DraftControlsInput = Route & { controls: SessionControlsSelection }
+export interface MagpieDraftModelControls {
+  /** Read the route's available choices and recent defaults without accessing a Session. */
+  describe(input: Route): DraftControls
+  /** Proven invalid input has code `draft-model-controls-invalid`. Operational errors propagate. */
+  validate(input: DraftControlsInput): void
+  /** Seed explicit controls before the first prompt. Identical persisted receipts are no-ops. */
+  initialize(input: DraftControlsInput & { sessionId: string }): void
+}
+
+export const DRAFT_MODEL_CONTROLS_INVALID = 'draft-model-controls-invalid'
+
+class DraftModelControlsInvalidError extends Error {
+  readonly code = DRAFT_MODEL_CONTROLS_INVALID
+}
+
+type SessionControlsChoices = DraftControls & {
   pendingWindow?: Pick<PendingWindow, 'id' | 'target'>
   windowWarning?: WindowWarning
 }
@@ -79,6 +98,11 @@ interface State {
   version: 1
   recent: Record<string, SessionControlsSelection>
   sessions: Record<string, SessionPreferences>
+  draftInitializations?: Record<string, DraftControlsInput>
+}
+
+function validDraftReceipt(value: unknown): value is DraftControlsInput {
+  return isRecord(value) && typeof value.provider === 'string' && typeof value.model === 'string' && validSelection(value.controls)
 }
 
 function isWindowChange(value: unknown): value is PendingWindow {
@@ -117,13 +141,16 @@ export class SessionControlsStore {
     }
     const raw: unknown = JSON.parse(text)
     if (!isRecord(raw) || raw.version !== 1 || !isRecord(raw.recent) || !Object.values(raw.recent).every(validSelection) ||
-      !isRecord(raw.sessions) || !Object.values(raw.sessions).every(validPreferences)) {
+      !isRecord(raw.sessions) || !Object.values(raw.sessions).every(validPreferences) ||
+      (raw.draftInitializations !== undefined && (!isRecord(raw.draftInitializations) ||
+        !Object.values(raw.draftInitializations).every(validDraftReceipt)))) {
       throw new Error('Invalid session controls state')
     }
     return (this.#state = {
       version: 1,
       recent: raw.recent as State['recent'],
       sessions: raw.sessions as State['sessions'],
+      draftInitializations: raw.draftInitializations as State['draftInitializations'],
     })
   }
 
@@ -160,6 +187,38 @@ export class SessionControlsStore {
   peek(id: string, route: SessionControlRoute): SessionPreferences {
     const state = this.#read()
     return state.sessions[sessionRouteKey(id, route)] ?? effectiveSelection(route, state.recent[routeKey(route)])
+  }
+
+  recent(route: SessionControlRoute): SessionControlsSelection {
+    return effectiveSelection(route, this.#read().recent[routeKey(route)])
+  }
+
+  initializeDraft(sessionId: string, input: DraftControlsInput, validate: () => SessionControlRoute): void {
+    const state = this.#read()
+    const receiptKey = JSON.stringify(sessionId)
+    const { controls } = input
+    const previous = state.draftInitializations?.[receiptKey]
+    if (previous) {
+      if (sameRoute(input, previous) && controls.speed === previous.controls.speed &&
+        controls.contextWindow === previous.controls.contextWindow) return
+      throw new DraftModelControlsInvalidError('This session already has a different Magpie draft initialization')
+    }
+
+    const route = validate()
+    const key = sessionRouteKey(sessionId, route)
+    // The Agent startup hook can already have captured the implicit defaults.
+    // Preserve that snapshot for fields the draft did not set explicitly.
+    const initial = state.sessions[key] ?? this.recent(route)
+    const next: SessionPreferences = { ...initial, ...controls }
+    if (controls.contextWindow !== undefined) {
+      delete next.pendingWindow
+      delete next.windowWarning
+    }
+    this.#replace({
+      ...state,
+      sessions: { ...state.sessions, [key]: next },
+      draftInitializations: { ...state.draftInitializations, [receiptKey]: input },
+    })
   }
 
   /** Replace preferences once and retain their previous state for synchronous compensation. */
@@ -280,6 +339,7 @@ interface SessionControlsOptions {
   agents: () => SessionControlsAgents | undefined
   catalogEfforts: (model: string) => readonly string[]
   catalogHasModel?: (model: string) => boolean
+  draftCatalogStatus?: (model: string) => 'available' | 'unavailable' | 'pending'
   requestMarker?: () => AgentLoopRequestMarker | undefined
   tokenMeter?: () => SessionControlsTokenMeter | undefined
   validateSelection?: (selection: SessionModelSelection, signal: AbortSignal) => Promise<unknown>
@@ -316,6 +376,55 @@ export class SessionControls {
 
   allowedEfforts(provider: string, model: string): readonly string[] | undefined {
     return this.#capabilities.get(routeKey({ provider, model }))?.efforts
+  }
+
+  describeDraft(input: Route): DraftControls {
+    const route = this.#capabilities.get(routeKey(input))
+    if (!route || this.#options.draftCatalogStatus?.(route.model) !== 'available') return {}
+    const recent = this.#enabled(route) ? this.#options.store.recent(route) : undefined
+    return this.#choices(route, recent)
+  }
+
+  #draftSelection(input: DraftControlsInput): SessionControlsSelection {
+    if (!isRecord(input) || typeof input.provider !== 'string' || !input.provider.trim() ||
+      typeof input.model !== 'string' || !input.model.trim()) {
+      throw new DraftModelControlsInvalidError('Expected a Magpie provider and model')
+    }
+    const { controls } = input
+    if (!validSelection(controls) || Object.keys(controls).some((field) => field !== 'speed' && field !== 'contextWindow')) {
+      throw new DraftModelControlsInvalidError('Invalid Magpie draft controls')
+    }
+    const { speed, contextWindow } = controls
+    return { ...(speed !== undefined && { speed }), ...(contextWindow !== undefined && { contextWindow }) }
+  }
+
+  #validateDraftRoute(input: DraftControlsInput): SessionControlRoute {
+    const route = this.#capabilities.get(routeKey(input))
+    if (route === undefined) throw new DraftModelControlsInvalidError('Magpie draft controls are unavailable for this model')
+    for (const [field, value] of Object.entries(input.controls)) {
+      if (!this.#allowsChoice(route, field, value)) {
+        throw new DraftModelControlsInvalidError(`Invalid or unavailable Magpie draft control: ${field}`)
+      }
+    }
+    const status = this.#options.draftCatalogStatus?.(route.model)
+    if (status === 'unavailable') throw new DraftModelControlsInvalidError('The Magpie model is not available')
+    if (status !== 'available') throw new Error('Magpie model catalog is not ready')
+    return route
+  }
+
+  validateDraft(input: DraftControlsInput): void {
+    const controls = this.#draftSelection(input)
+    if (Object.keys(controls).length > 0) this.#validateDraftRoute({ ...input, controls })
+  }
+
+  initializeDraft(input: DraftControlsInput & { sessionId: string }): void {
+    const controls = this.#draftSelection(input)
+    if (typeof input.sessionId !== 'string' || !input.sessionId.trim()) {
+      throw new DraftModelControlsInvalidError('Expected a Session ID for Magpie draft initialization')
+    }
+    if (Object.keys(controls).length === 0) return
+    const draft = { provider: input.provider, model: input.model, controls }
+    this.#options.store.initializeDraft(input.sessionId, draft, () => this.#validateDraftRoute(draft))
   }
 
   #enabled(route: SessionControlRoute | undefined): boolean {
@@ -533,17 +642,35 @@ export class SessionControls {
     return this.#options.catalogHasModel !== undefined && this.#capabilities.has(routeKey(route))
   }
 
+  #allowsChoice(route: SessionControlRoute, field: string, value: unknown): boolean {
+    switch (field) {
+      case 'speed':
+        return this.#options.config.sessionSpeedEnabled && isSessionControlSpeed(value) &&
+          route.speed?.options.includes(value) === true
+      case 'contextWindow':
+        return this.#options.config.sessionContextWindowEnabled && isContextWindow(value) &&
+          route.contextWindow?.options.includes(value) === true
+      default:
+        return false
+    }
+  }
+
+  #choices(route: SessionControlRoute, selection?: SessionControlsSelection): DraftControls {
+    const choices: DraftControls = {}
+    const value = this.#enabledSelection(route, selection)
+    if (route.speed && value.speed !== undefined) {
+      choices.speed = { options: [...route.speed.options], value: value.speed }
+    }
+    if (route.contextWindow && value.contextWindow !== undefined) {
+      choices.contextWindow = { options: [...route.contextWindow.options], value: value.contextWindow }
+    }
+    if (route.efforts !== undefined) choices.efforts = this.#efforts(route)
+    return choices
+  }
+
   #view(agent: SessionControlsAgent, route: SessionControlRoute, selection?: SessionPreferences): SessionControlsView {
-    const view: SessionControlsChoices = {}
-    const value = effectiveSelection(route, selection)
-    if (this.#options.config.sessionSpeedEnabled && route.speed && value.speed !== undefined) {
-      view.speed = { options: route.speed.options, value: value.speed }
-    }
-    if (this.#options.config.sessionContextWindowEnabled && route.contextWindow && value.contextWindow !== undefined) {
-      view.contextWindow = { options: route.contextWindow.options, value: value.contextWindow }
-    }
-    const efforts = this.#efforts(route)
-    if (route.efforts !== undefined) view.efforts = efforts
+    const view: SessionControlsChoices = this.#choices(route, selection)
+    const efforts = view.efforts ?? this.#efforts(route)
     if (!this.#supportsBatch(agent, route)) return view
     const runningEdits = this.#supportsRunningEdits(route)
     const retained = view.contextWindow?.value
@@ -583,14 +710,12 @@ export class SessionControls {
     for (const [field, value] of Object.entries(request.changes)) {
       switch (field) {
         case 'speed':
-          if (!(this.#options.config.sessionSpeedEnabled && route.speed &&
-            isSessionControlSpeed(value) && route.speed.options.includes(value))) return valid(field)
-          patch.speed = value
+          if (!this.#allowsChoice(route, field, value)) return valid(field)
+          patch.speed = value as SessionControlSpeed
           break
         case 'contextWindow':
-          if (!(this.#options.config.sessionContextWindowEnabled && route.contextWindow &&
-            isContextWindow(value) && route.contextWindow.options.includes(value))) return valid(field)
-          patch.contextWindow = value
+          if (!this.#allowsChoice(route, field, value)) return valid(field)
+          patch.contextWindow = value as number
           break
         case 'reasoningEffort':
           if (agent.session.header.origin === 'subagent') {

@@ -1,10 +1,11 @@
 import assert from 'node:assert/strict'
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, renameSync, rmSync, writeFileSync } from 'node:fs'
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, renameSync, rmdirSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
 import { setImmediate } from 'node:timers/promises'
 import test, { type TestContext } from 'node:test'
 import { Config, resolveConfig, type DshMagpieConnectConfig } from '../src/config.ts'
+import { ModelCatalog } from '../src/adapter/catalog.ts'
 import { __resetSettingsRoutes, apply, SESSION_CONTROLS_API, type PluginContext } from '../src/index.ts'
 import type { MagpieAdapter } from '../src/adapter/magpie-adapter.ts'
 import {
@@ -183,6 +184,50 @@ test('GET loads options without updating recency and models/sessions keep separa
   assert.deepEqual(selection(f, 'fourth', astra), { ...defaultChoice, contextWindow: 872_000 })
   add(f, stubAgent('unsupported', other))
   assert.deepEqual(await (await send(f, getRequest('unsupported', other))).json(), { ok: true, value: {} })
+})
+
+test('draft validation distinguishes proven invalid controls from readiness and persistence failures', async (t) => {
+  const path = statePath(t)
+  const modelList = deferred()
+  const catalog = new ModelCatalog({ baseUrl: 'https://gateway.test/v1', fetchImpl: async () => {
+    await modelList.promise
+    return Response.json({ data: [{ id: sol.model }] })
+  } })
+  const config = resolveConfig({ providerId: sol.provider })
+  const store = new SessionControlsStore(path)
+  let sessionServiceReads = 0
+  const controls = new SessionControls({ config, store, agents: () => { sessionServiceReads++; return undefined },
+    catalogEfforts: () => [], draftCatalogStatus: (model) => catalog.draftRouteStatus(model), warn: () => {} })
+  const draft = { ...sol, sessionId: 'draft', controls: { contextWindow: 872_000 } }
+  const invalid = { code: 'draft-model-controls-invalid' }
+  const pending = catalog.refreshModels()
+  assert.deepEqual(controls.describeDraft(sol), {})
+  assert.throws(() => controls.validateDraft(draft), { message: 'Magpie model catalog is not ready' })
+  assert.throws(() => controls.validateDraft({ ...draft, controls: { contextWindow: 123 } }), invalid)
+  assert.equal(existsSync(path), false)
+  modelList.resolve()
+  await pending
+  controls.validateDraft(draft)
+  assert.throws(() => controls.validateDraft({ ...draft, ...astra }), invalid)
+  assert.deepEqual(controls.describeDraft({ ...sol, model: other.model }), {})
+  assert.equal(existsSync(path), false)
+
+  writeFileSync(path, '{broken json')
+  assert.throws(() => controls.initializeDraft(draft), SyntaxError)
+  assert.equal(readFileSync(path, 'utf8'), '{broken json')
+  writeFileSync(path, JSON.stringify({ version: 1, recent: { [JSON.stringify([sol.provider, sol.model])]: { speed: 'ultrafast' } }, sessions: {} }))
+  assert.equal(controls.describeDraft(sol).speed?.value, 'ultrafast')
+  renameSync(path, `${path}.backup`)
+  mkdirSync(path)
+  assert.throws(() => controls.initializeDraft(draft), { code: 'EISDIR' })
+  rmdirSync(path)
+  renameSync(`${path}.backup`, path)
+  controls.initializeDraft(draft)
+  assert.equal(controls.describeDraft(sol).contextWindow?.value, 500_000)
+  assert.equal(controls.describeDraft(sol).speed?.value, 'ultrafast')
+  controls.initializeDraft({ ...draft, controls: {} })
+  assert.equal(sessionServiceReads, 0)
+  assert.deepEqual(controls.resolve(sol.provider, sol.model, draft.sessionId), { speed: 'ultrafast', contextWindow: 872_000 })
 })
 
 test('fresh and fork children capture the parent step’s actual route only once', async (t) => {

@@ -34,10 +34,26 @@ type WindowState = {
     windowWarning?: WindowWarning;
 };
 type SessionPreferences = SessionControlsSelection & WindowState;
-type SessionControlsChoices = {
+export type DraftControls = {
     speed?: Choice<SessionControlSpeed>;
     contextWindow?: Choice<number>;
     efforts?: string[];
+};
+type DraftControlsInput = Route & {
+    controls: SessionControlsSelection;
+};
+export interface MagpieDraftModelControls {
+    /** Read the route's available choices and recent defaults without accessing a Session. */
+    describe(input: Route): DraftControls;
+    /** Proven invalid input has code `draft-model-controls-invalid`. Operational errors propagate. */
+    validate(input: DraftControlsInput): void;
+    /** Seed explicit controls before the first prompt. Identical persisted receipts are no-ops. */
+    initialize(input: DraftControlsInput & {
+        sessionId: string;
+    }): void;
+}
+export declare const DRAFT_MODEL_CONTROLS_INVALID = "draft-model-controls-invalid";
+type SessionControlsChoices = DraftControls & {
     pendingWindow?: Pick<PendingWindow, 'id' | 'target'>;
     windowWarning?: WindowWarning;
 };
@@ -90,6 +106,8 @@ export declare class SessionControlsStore {
     constructor(path: string);
     snapshot(id: string, route: SessionControlRoute, inherited?: SessionControlsSelection): SessionPreferences;
     peek(id: string, route: SessionControlRoute): SessionPreferences;
+    recent(route: SessionControlRoute): SessionControlsSelection;
+    initializeDraft(sessionId: string, input: DraftControlsInput, validate: () => SessionControlRoute): void;
     /** Replace preferences once and retain their previous state for synchronous compensation. */
     set(id: string, route: SessionControlRoute, change: SessionControlsSelection, window?: WindowState): () => void;
     settleWindow(id: string, route: SessionControlRoute, candidate: PendingWindow, reason?: WindowWarningReason): void;
@@ -133,6 +151,7 @@ interface SessionControlsOptions {
     agents: () => SessionControlsAgents | undefined;
     catalogEfforts: (model: string) => readonly string[];
     catalogHasModel?: (model: string) => boolean;
+    draftCatalogStatus?: (model: string) => 'available' | 'unavailable' | 'pending';
     requestMarker?: () => AgentLoopRequestMarker | undefined;
     tokenMeter?: () => SessionControlsTokenMeter | undefined;
     validateSelection?: (selection: SessionModelSelection, signal: AbortSignal) => Promise<unknown>;
@@ -143,6 +162,11 @@ export declare class SessionControls {
     #private;
     constructor(options: SessionControlsOptions);
     allowedEfforts(provider: string, model: string): readonly string[] | undefined;
+    describeDraft(input: Route): DraftControls;
+    validateDraft(input: DraftControlsInput): void;
+    initializeDraft(input: DraftControlsInput & {
+        sessionId: string;
+    }): void;
     /** Capture the step already underway even if a new model is selected for the next step. */
     observeStep(agent: SessionControlsAgent, modelSelection: SessionModelSelection, position?: StepPosition): void;
     observeIdle(agent: SessionControlsAgent): void;

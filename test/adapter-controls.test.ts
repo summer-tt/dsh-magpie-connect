@@ -2,15 +2,19 @@ import { AsyncLocalStorage } from 'node:async_hooks'
 import assert from 'node:assert/strict'
 import { once } from 'node:events'
 import { createServer, type IncomingHttpHeaders } from 'node:http'
+import { createRequire } from 'node:module'
+import { setTimeout } from 'node:timers/promises'
 import test, { type TestContext } from 'node:test'
+import { pathToFileURL } from 'node:url'
 
 import { decodeMagpieModels, ModelCatalog } from '../src/adapter/catalog.ts'
 import type { HarnessChunk } from '../src/adapter/events.ts'
 import { MagpieAdapter, type MagpieAdapterOptions } from '../src/adapter/magpie-adapter.ts'
 import type { HarnessGenerateOptions } from '../src/adapter/messages.ts'
-import { resolveConfig } from '../src/config.ts'
-import { SessionControls, SessionControlsStore } from '../src/session-controls.ts'
-import { mkdtempSync, rmSync } from 'node:fs'
+import { resolveConfig, type DshMagpieConnectConfig } from '../src/config.ts'
+import { apply, inject, MAGPIE_DRAFT_MODEL_CONTROLS, SESSION_CONTROLS_API } from '../src/index.ts'
+import { SessionControls, SessionControlsStore, type MagpieDraftModelControls, type SessionControlsAgent } from '../src/session-controls.ts'
+import { existsSync, mkdtempSync, readFileSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 
@@ -58,12 +62,18 @@ interface RequestSeen {
   body: Record<string, unknown>
 }
 
-async function mockGateway(t: TestContext, { inputTokens = 10, failFirstRequest }: {
+async function mockGateway(t: TestContext, { inputTokens = 10, failFirstRequest, directory }: {
   inputTokens?: number
   failFirstRequest?: () => void
+  directory?: unknown[]
 } = {}) {
   const calls: RequestSeen[] = []
   const server = createServer(async (request, response) => {
+    if (request.url === '/v1/models' && directory) {
+      response.writeHead(200, { 'content-type': 'application/json' })
+      response.end(JSON.stringify({ data: directory }))
+      return
+    }
     const chunks: Buffer[] = []
     for await (const chunk of request) chunks.push(chunk)
     const endpoint = request.url ?? ''
@@ -116,6 +126,127 @@ async function finish(stream: AsyncIterable<HarnessChunk>) {
   for await (const chunk of stream) last = chunk
   assert.ok(last?.type === 'finish')
   return last.reason
+}
+
+test('Cordis draft service seeds the first prepared request and bound Session view across reload', async (t) => {
+  type Fiber = { dispose(): Promise<void> }
+  type Host = {
+    provide(name: string, value: unknown): void
+    plugin(plugin: { inject: readonly string[]; apply: typeof apply }, config: DshMagpieConnectConfig): PromiseLike<Fiber>
+    root: { reflect: { get(name: string): MagpieDraftModelControls | undefined } }
+    emit(name: string, payload: unknown): void
+  }
+  let cordisPath: string
+  try {
+    const dshAnchor = process.env.DSH_INSTALL_DIR
+      ? join(process.env.DSH_INSTALL_DIR, 'package.json')
+      : createRequire(import.meta.url).resolve('@deepseek-ai/dsh/package.json')
+    cordisPath = createRequire(dshAnchor).resolve('@deepseek-ai/cordis')
+  } catch {
+    t.skip('A DSH installation with Cordis is needed for the Host integration test')
+    return
+  }
+  const { Context } = await import(pathToFileURL(cordisPath).href) as { Context: new () => Host }
+  const host = new Context()
+  const dataDir = mkdtempSync(join(tmpdir(), 'magpie-draft-host-'))
+  const statePath = join(dataDir, 'session-controls.json')
+  t.after(() => rmSync(dataDir, { recursive: true, force: true }))
+  const { baseUrl, calls } = await mockGateway(t, { directory: [
+    { id: model, native_endpoints: ['/v1/responses'], context_window: catalogWindow, max_output_tokens: gatewayOutputLimit,
+      reasoning: true, supported_reasoning_levels: ['low', 'high', 'ultra'] },
+    { id: 'codex/gpt-6.2-astra' },
+  ] })
+  const route = { provider, model }
+  const config: DshMagpieConnectConfig = { providerId: provider, baseUrl, apiKey: 'test-key', dataDir, maxRetries: 0,
+    sessionControlRoutes: [{ ...route, efforts: ['high', 'medium'], speed: { options: ['standard', 'ultrafast'], default: 'standard' },
+      contextWindow: { options: [narrowWindow, wideWindow], default: narrowWindow } },
+    { provider, model: 'codex/gpt-6.2-astra' },
+    { provider, model: 'absent', speed: { options: ['standard'], default: 'standard' } }],
+  }
+  let adapter: MagpieAdapter | undefined
+  let initiator: SessionControlsAgent | undefined
+  let sessionLookups = 0
+  const boundRoutes = new Map<string, { fetch: (request: Request) => Promise<Response> }>()
+  host.provide('llm', { registerAdapter: (_providers: string[], value: MagpieAdapter) => { adapter = value } })
+  host.provide('agents', {
+    get: (id: string) => { sessionLookups++; return initiator?.id === id ? initiator : undefined },
+    currentInitiator: () => initiator,
+  })
+  host.provide('connection', { fetch: { register: (entry: { path: string; fetch: (request: Request) => Promise<Response> }) => {
+    boundRoutes.set(entry.path, entry)
+    return () => { boundRoutes.delete(entry.path) }
+  } } })
+  const plugin = { inject, apply }
+  let fiber = await host.plugin(plugin, config)
+  t.after(async () => { await fiber.dispose() })
+  const getService = () => host.root.reflect.get(MAGPIE_DRAFT_MODEL_CONTROLS)
+  const service = getService()
+  assert.ok(service)
+  assert.ok(adapter)
+  await waitForCatalog(adapter)
+  assert.deepEqual(service.describe(route), {
+    speed: { options: ['standard', 'ultrafast'], value: 'standard' },
+    contextWindow: { options: [narrowWindow, wideWindow], value: narrowWindow },
+    efforts: ['high'],
+  })
+  for (const unsupported of [{ ...route, provider: 'different' }, { ...route, model: 'unknown' },
+    { ...route, model: 'codex/gpt-6.2-astra' }, { ...route, model: 'absent' }]) {
+    assert.deepEqual(service.describe(unsupported), {})
+    assert.throws(() => service.validate({ ...unsupported, controls: { speed: 'standard' } }), { code: 'draft-model-controls-invalid' })
+  }
+  assert.throws(() => service.validate({ ...route, controls: { speed: 'fast' } }), { code: 'draft-model-controls-invalid' })
+  assert.equal(sessionLookups, 0)
+  assert.equal(existsSync(statePath), false)
+
+  const sessionId = 'draft-session'
+  const draft = { ...route, sessionId, controls: { speed: 'ultrafast' as const, contextWindow: wideWindow } }
+  service.validate(draft)
+  const agent: SessionControlsAgent = { id: sessionId, status: 'idle', session: { id: sessionId, header: {} },
+    model: { current: () => ({ ...route, reasoningEffort: 'high' }) },
+    runMaintenance: (task) => task(new AbortController().signal),
+  }
+  // Draft setup seeds the unpublished Session before Cordis dispatches startup.
+  service.initialize(draft)
+  await host.emit('agent/created', { agent, source: 'startup' })
+  initiator = agent
+  const prepared = await adapter.prepareCall(provider, model)
+  assert.deepEqual(prepared.model.context, { contextWindow: wideWindow })
+  assert.deepEqual(await finish(prepared.stream(request({ sessionId, reasoningEffort: 'high' }))), { kind: 'stop' })
+  assert.equal(calls[0]?.body.service_tier, 'ultrafast')
+  assert.deepEqual(calls[0]?.body.reasoning, { effort: 'high', summary: 'auto' })
+  assert.equal(calls[0]?.body.max_output_tokens, wideDefault)
+
+  const bound = boundRoutes.get(SESSION_CONTROLS_API)
+  assert.ok(bound)
+  const url = `http://localhost${SESSION_CONTROLS_API}`
+  const getView = async () => (await (await bound.fetch(new Request(`${url}?${new URLSearchParams({ ...route, sessionId })}`))).json()).value
+  assert.equal((await getView()).speed.value, 'ultrafast')
+  assert.equal((await getView()).contextWindow.value, wideWindow)
+  assert.equal(service.describe(route).contextWindow?.value, narrowWindow)
+  const response = await bound.fetch(new Request(url, { method: 'POST', body: JSON.stringify({ ...route, sessionId, field: 'speed', value: 'standard' }) }))
+  assert.equal(response.status, 200)
+  const saved = readFileSync(statePath, 'utf8')
+  service.initialize(draft)
+  assert.equal(readFileSync(statePath, 'utf8'), saved)
+  assert.throws(() => service.initialize({ ...draft, controls: { speed: 'standard' } }), { code: 'draft-model-controls-invalid' })
+
+  await fiber.dispose()
+  assert.equal(getService(), undefined)
+  fiber = await host.plugin(plugin, { ...config, sessionSpeedEnabled: false })
+  const reloaded = getService()
+  assert.ok(reloaded)
+  // The persisted receipt wins even if the next generation has not warmed up
+  // or configuration no longer supports the originally submitted controls.
+  reloaded.initialize(draft)
+  assert.equal(readFileSync(statePath, 'utf8'), saved)
+})
+
+async function waitForCatalog(adapter: MagpieAdapter): Promise<void> {
+  for (let attempt = 0; attempt < 100; attempt++) {
+    if (adapter.listModels(provider).some(({ id }) => id === model)) return
+    await setTimeout(10)
+  }
+  assert.fail('The test gateway catalog did not become visible')
 }
 
 for (const transport of transports) {

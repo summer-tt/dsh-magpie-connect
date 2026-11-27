@@ -207,6 +207,8 @@ export declare class ModelCatalog {
      */
     sourceFor(model: string): 'gateway' | 'static' | 'none';
     isEnabled(model: string): boolean;
+    /** A cache can establish availability, but only a live directory can establish absence. */
+    draftRouteStatus(model: string): 'available' | 'unavailable' | 'pending';
     /**
      * Point the refresh loop at another API root or credential (settings page
      * change).

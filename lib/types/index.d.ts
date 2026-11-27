@@ -1,6 +1,6 @@
 import { ModelCatalog } from './adapter/catalog.ts';
 import { type DshMagpieConnectConfig } from './config.ts';
-import { SessionControls, type SessionModelSelection } from './session-controls.ts';
+import { SessionControls, type MagpieDraftModelControls, type SessionModelSelection } from './session-controls.ts';
 import { SettingsStore, type EffectiveSearchSettings, type McpServerStatusView } from './settings.ts';
 /**
  * dsh-magpie-connect DSH cordis plugin entry.
@@ -31,6 +31,7 @@ export interface PluginContext {
         resolveCallConfig?(selection: SessionModelSelection, signal?: AbortSignal): Promise<unknown>;
     };
     get?(key: string): unknown;
+    provide?(key: string, value: MagpieDraftModelControls): () => void;
     inject?(deps: string[], fn: (ctx: Record<string, unknown>) => unknown): unknown;
     effect?(fn: () => () => void): unknown;
     on?(event: string, listener: (...args: never[]) => unknown, options?: {
@@ -49,6 +50,7 @@ export declare const inject: readonly ["llm"];
 export declare const SETTINGS_API = "/api/magpie-settings";
 export declare const MODELS_API = "/api/magpie-models";
 export declare const SESSION_CONTROLS_API = "/api/magpie-session-controls";
+export declare const MAGPIE_DRAFT_MODEL_CONTROLS = "magpieDraftModelControls";
 export declare const TEST_API = "/api/magpie-test";
 /**
  * Candidate discovery: asks the endpoint the form currently shows (including a
@@ -151,13 +153,14 @@ export type CandidateRow = Omit<ModelRow, 'enabled'>;
 export declare function __resetSearchProviders(): void;
 /** @internal Test hook: forget installed routes so the next apply reinstalls. */
 export declare function __resetSettingsRoutes(): void;
-export declare function apply(ctx: PluginContext, config?: DshMagpieConnectConfig): {
+export declare function apply(ctx: PluginContext, config?: DshMagpieConnectConfig): Promise<void> & {
     ready: Promise<{
         version: string;
     }>;
 };
 export { MagpieAdapter } from './adapter/magpie-adapter.ts';
 export { ModelCatalog } from './adapter/catalog.ts';
+export { DRAFT_MODEL_CONTROLS_INVALID, type DraftControls, type MagpieDraftModelControls } from './session-controls.ts';
 export { MagpieSearchProvider, MagpieSearchError, mapAnthropicSearchResponse, parseMagpieMcpSearchText, searchViaMagpieMcp, searchViaMagpieModel, } from './search.ts';
 export { SettingsStore, isConfigured, resolveEffectiveEndpoint, resolveEffectiveSearchSettings, type MagpieSearchMode, } from './settings.ts';
 export { Config, resolveConfig, type DshMagpieConnectConfig, } from './config.ts';

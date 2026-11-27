@@ -19,6 +19,7 @@ import {
   acquireSessionControlsStore,
   handleSessionControls,
   type AgentLoopRequestMarker,
+  type MagpieDraftModelControls,
   type SessionControlsAgent,
   type SessionControlsAgents,
   type SessionControlsCreated,
@@ -90,6 +91,7 @@ export interface PluginContext {
     resolveCallConfig?(selection: SessionModelSelection, signal?: AbortSignal): Promise<unknown>
   }
   get?(key: string): unknown
+  provide?(key: string, value: MagpieDraftModelControls): () => void
   inject?(deps: string[], fn: (ctx: Record<string, unknown>) => unknown): unknown
   effect?(fn: () => () => void): unknown
   on?(event: string, listener: (...args: never[]) => unknown, options?: { prepend?: boolean }): () => void
@@ -108,6 +110,7 @@ export const inject = ['llm'] as const
 export const SETTINGS_API = '/api/magpie-settings'
 export const MODELS_API = '/api/magpie-models'
 export const SESSION_CONTROLS_API = '/api/magpie-session-controls'
+export const MAGPIE_DRAFT_MODEL_CONTROLS = 'magpieDraftModelControls'
 export const TEST_API = '/api/magpie-test'
 /**
  * Candidate discovery: asks the endpoint the form currently shows (including a
@@ -1220,7 +1223,7 @@ function installSearchProvider(
 export function apply(
   ctx: PluginContext,
   config: DshMagpieConnectConfig = {},
-): { ready: Promise<{ version: string }> } {
+): Promise<void> & { ready: Promise<{ version: string }> } {
   const logger = ctx.logger
   const cfg = resolveConfig(config)
   let requestMarker: AgentLoopRequestMarker | undefined
@@ -1238,10 +1241,13 @@ export function apply(
     }
   })()
   const ready = markerReady.then(() => ({ version: 'adapter' }))
+  // Cordis awaits a startup effect that resolves to void. Keep `.ready` for
+  // callers that need the adapter version directly.
+  const activation = Object.assign(markerReady, { ready })
 
   if (!ctx.llm || typeof ctx.llm.registerAdapter !== 'function') {
     logger.error('dsh-magpie-connect: llm service unavailable; adapter cannot register')
-    return { ready }
+    return activation
   }
 
   const dataDir = cfg.dataDir
@@ -1394,6 +1400,7 @@ export function apply(
     },
     onInvalidate: announceTopology,
   })
+  let draftSettingsReady = false
   const controlsStore = acquireSessionControlsStore(dataDir)
   const agents = (): SessionControlsAgents | undefined => ctx.get?.('agents') as SessionControlsAgents | undefined
   const listModels = ctx.llm?.listModels?.bind(ctx.llm)
@@ -1404,6 +1411,7 @@ export function apply(
     agents,
     catalogEfforts: (model) => catalog.reasoningFor(model)?.efforts.map(({ id }) => id) ?? [],
     ...(ctx.on && { catalogHasModel: (model: string) => catalog.list().includes(model) }),
+    draftCatalogStatus: (model) => draftSettingsReady ? catalog.draftRouteStatus(model) : 'pending',
     requestMarker: () => requestMarker,
     tokenMeter: () => ctx.get?.('tokenMeter') as SessionControlsTokenMeter | undefined,
     ...(listModels && resolveCallConfig && { validateSelection: async (selection, signal) => {
@@ -1507,6 +1515,7 @@ export function apply(
     const persisted = await store.read()
     await store.hydrate(persisted, undefined)
     applyPageSettings()
+    draftSettingsReady = true
     await catalog.start().catch((err) => {
       logger.error(`dsh-magpie-connect: catalog start failed: ${err instanceof Error ? err.message : String(err)}`)
     })
@@ -1547,6 +1556,17 @@ export function apply(
   } catch {
     // presentation policy is best-effort
   }
+
+  ctx.effect?.(() => () => {
+    if (currentBackend?.sessionControls === sessionControls) currentBackend = null
+    catalog.stop()
+    controlsStore.release()
+  })
+  ctx.provide?.(MAGPIE_DRAFT_MODEL_CONTROLS, {
+    describe: (input) => backendOrThrow().sessionControls.describeDraft(input),
+    validate: (input) => backendOrThrow().sessionControls.validateDraft(input),
+    initialize: (input) => backendOrThrow().sessionControls.initializeDraft(input),
+  })
 
   // Newest generation wins: shared route handlers below always resolve through
   // here, so the settings page talks to the latest store/catalog/adapter even
@@ -1652,19 +1672,12 @@ export function apply(
     },
   })
 
-  const maybeEffect = (ctx as { effect?: PluginContext['effect'] }).effect
-  if (typeof maybeEffect === 'function') {
-    maybeEffect.call(ctx, () => () => {
-      if (currentBackend?.sessionControls === sessionControls) currentBackend = null
-      catalog.stop()
-      controlsStore.release()
-    })
-  }
-  return { ready }
+  return activation
 }
 
 export { MagpieAdapter } from './adapter/magpie-adapter.ts'
 export { ModelCatalog } from './adapter/catalog.ts'
+export { DRAFT_MODEL_CONTROLS_INVALID, type DraftControls, type MagpieDraftModelControls } from './session-controls.ts'
 export {
   MagpieSearchProvider,
   MagpieSearchError,

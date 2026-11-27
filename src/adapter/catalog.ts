@@ -376,6 +376,8 @@ export class ModelCatalog {
    */
   #enabled: Set<string> | null = null
   #updatedAt = 0
+  #endpointRevision = 0
+  #liveDirectory = false
   #lastError = ''
   #refreshSeconds: number
   #cachePath?: string
@@ -526,6 +528,7 @@ export class ModelCatalog {
     if (entries.size === 0) return false
     this.#entries = new Map(entries)
     this.#updatedAt = this.#now()
+    this.#liveDirectory = true
     this.#lastError = ''
     if (this.#cachePath) void saveModelsCache(this.#cachePath, entries, this.#now()).catch(() => {})
     this.#announce()
@@ -537,16 +540,21 @@ export class ModelCatalog {
       this.#lastError = 'magpie gateway API URL or key is not configured — set both on the Magpie settings page'
       return
     }
+    const revision = this.#endpointRevision
     try {
       const entries = await fetchMagpieModels(this.#baseUrl, this.#fetch, { headers: this.#authHeaders() })
+      if (revision !== this.#endpointRevision) return
       this.#entries = entries
       this.#updatedAt = this.#now()
+      this.#liveDirectory = true
       this.#lastError = ''
       if (this.#cachePath) await saveModelsCache(this.#cachePath, entries, this.#now()).catch(() => {})
     } catch (err) {
+      if (revision !== this.#endpointRevision) return
       // Network failure with a cached copy is not fatal: load the cache.
       if (this.#cachePath && this.#entries.size === 0) {
         const cached = await loadModelsCache(this.#cachePath).catch(() => null)
+        if (revision !== this.#endpointRevision) return
         if (cached && cached.size > 0) {
           this.#entries = cached
           this.#updatedAt = this.#updatedAt === 0 ? this.#now() : this.#updatedAt
@@ -607,6 +615,15 @@ export class ModelCatalog {
     return this.#offers(model)
   }
 
+  /** A cache can establish availability, but only a live directory can establish absence. */
+  draftRouteStatus(model: string): 'available' | 'unavailable' | 'pending' {
+    if (!this.configured) return 'pending'
+    if (!this.#offers(model)) return 'unavailable'
+    if (this.#entries.has(model) || this.#entries.size === 0 && this.#entryFor(model)) return 'available'
+    const live = this.#liveDirectory && !this.#lastError && this.#now() - this.#updatedAt <= 10 * 60 * 1_000
+    return live ? 'unavailable' : 'pending'
+  }
+
   /**
    * Point the refresh loop at another API root or credential (settings page
    * change).
@@ -626,6 +643,8 @@ export class ModelCatalog {
     const rootChanged = root !== this.#baseUrl
     this.#baseUrl = root
     this.#apiKey = key
+    this.#endpointRevision++
+    this.#liveDirectory = false
     if (rootChanged) {
       // Drop entries from the previous root: the picker must not serve a
       // stale directory, and clearing unconfigured state must empty it.
